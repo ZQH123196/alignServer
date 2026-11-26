@@ -2,7 +2,7 @@
 name = "long-audio-aligner"
 version = "0.1.0"
 description = "Long audio alignment pipeline using VAD, ASR (Qwen3), and FA with FastAPI Server"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 
 # 基础必须依赖 (业务逻辑强相关 + Web服务强相关)
 dependencies = [
@@ -19,6 +19,7 @@ dependencies = [
     "uvicorn>=0.23.0",           
     "python-multipart>=0.0.6",   # 用于解析 OpenAI 的表单数据
     "gradio>=4.0.0",             # 可视化调试 UI
+    "epitran>=1.35.2",
 ]
 
 # 可选环境依赖 (通过 pip install -e ".[环境名]" 安装)

@@ -170,8 +170,27 @@ if [[ "$use_gpu" == "y" || "$use_gpu" == "Y" ]]; then
     fi
 
     # 下载并安装
-    wget -nc https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
-    uv pip install flash_attn-2.8.3.post1+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+    FLASH_ATTN_WHL="flash_attn-2.8.3.post1+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
+    FLASH_ATTN_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/${FLASH_ATTN_WHL}"
+
+    if [ -f "$FLASH_ATTN_WHL" ]; then
+        echo "    -> ✅ 检测到 ${FLASH_ATTN_WHL} 已存在，跳过下载..."
+    else
+        echo "    -> 准备下载 ${FLASH_ATTN_WHL}..."
+
+        # 自动安装 aria2c
+        if ! command -v aria2c &> /dev/null; then
+            echo "       ⚠️ 未检测到 aria2c，自动安装中..."
+            apt-get install -y aria2
+        fi
+
+        echo "       使用 aria2c (多连接加速)..."
+        aria2c -x 16 -s 16 -k 1M \
+               --auto-file-renaming=false \
+               --console-log-level=warn \
+               -o "$FLASH_ATTN_WHL" "$FLASH_ATTN_URL"
+    fi
+    uv pip install "$FLASH_ATTN_WHL"
 
     # 安装完成后，如果是国内环境，关闭代理以免影响后续国内源（如 HF-Mirror/清华源）的访问
     if [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
@@ -277,6 +296,8 @@ EOF
 echo "正在尝试关闭 swap 内存交互，避免数据从内存卸载到硬盘..."
 swapoff -a || true 
 
+# IPA 依赖，epitran 库所需
+apt-get install -y flite
 echo ""
 echo "✅ 环境配置与所有模型（Qwen & VAD）全量下载完毕！"
 echo "🚀 正在启动服务..."
