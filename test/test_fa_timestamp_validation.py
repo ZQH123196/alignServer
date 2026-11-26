@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from fa_timestamp_validation import (
     FA_INTERVAL_OVERLAP_MAX_SEC,
     FaTimestampError,
+    clamp_seam_interval,
     normalize_fa_interval_overlaps,
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
@@ -349,6 +350,107 @@ class NormalizeIntervalOverlapsTests(unittest.TestCase):
         # Assert
         self.assertEqual(clamped, 0)
         self.assertAlmostEqual(normalized[0].start_time, 0.0, places=6)
+
+
+class ClampSeamIntervalTests(unittest.TestCase):
+    """块接缝不变式：每个词条的 start 必须 >= 此前所有已输出词条的 end。
+
+    2026-10-17 第 4 章事故：只比前一任的 start/end 时，「〖」被抬到
+    42700..42740 后，「士」42700..43180 仍算「没回退」，下游按前词 end
+    补位标点后才炸成时间回退。
+    """
+
+    def test_incident_pair_is_pushed_after_previous_end(self) -> None:
+        # Arrange: 的 42.580..42.740 来自 chunk[1]，士 42.700..43.180 来自 chunk[2]
+        # Act
+        new_start, new_end, overlap, regression = clamp_seam_interval(
+            42.580, 42.740, 42.740, 42.700, 43.180,
+        )
+
+        # Assert: 起点抬到此前最大 end，终点不动，点态没有回退
+        self.assertAlmostEqual(new_start, 42.740, places=6)
+        self.assertAlmostEqual(new_end, 43.180, places=6)
+        self.assertAlmostEqual(overlap, 0.040, places=6)
+        self.assertAlmostEqual(regression, 0.0, places=6)
+
+    def test_word_after_clamped_punctuation_is_pushed_too(self) -> None:
+        # Arrange: 标点已被钳制成 42.740..42.740，紧随的实词仍在 42.700 起
+        # Act
+        new_start, new_end, overlap, _ = clamp_seam_interval(
+            42.740, 42.740, 42.740, 42.700, 43.180,
+        )
+
+        # Assert: 只看前项的 start/end 时 regression = 0，靠 max_end 才抓得住
+        self.assertAlmostEqual(new_start, 42.740, places=6)
+        self.assertAlmostEqual(new_end, 43.180, places=6)
+        self.assertAlmostEqual(overlap, 0.040, places=6)
+
+    def test_disjoint_interval_is_returned_unchanged(self) -> None:
+        # Act
+        new_start, new_end, overlap, regression = clamp_seam_interval(
+            0.0, 1.0, 1.0, 1.0, 2.0,
+        )
+
+        # Assert
+        self.assertEqual((new_start, new_end, overlap, regression), (1.0, 2.0, 0.0, 0.0))
+
+    def test_floating_point_tail_inside_tolerance_is_not_a_drift(self) -> None:
+        # Arrange: round 到毫秒后的浮点尾差
+        # Act
+        new_start, new_end, overlap, regression = clamp_seam_interval(
+            0.0, 1.0000000001, 1.0000000001, 1.0, 2.0,
+        )
+
+        # Assert: 不动、不报
+        self.assertEqual((new_start, new_end, overlap, regression), (1.0, 2.0, 0.0, 0.0))
+
+    def test_end_regression_is_reported(self) -> None:
+        # Act
+        _, new_end, overlap, regression = clamp_seam_interval(
+            0.0, 1.0, 1.0, 0.5, 0.9,
+        )
+
+        # Assert
+        self.assertAlmostEqual(overlap, 0.5, places=6)
+        self.assertAlmostEqual(regression, 0.1, places=6)
+        self.assertAlmostEqual(new_end, 1.0, places=6)
+
+    def test_word_entirely_before_previous_end_becomes_zero_width(self) -> None:
+        # Arrange: 当前词的 end 也在此前最大 end 之前
+        # Act
+        new_start, new_end, overlap, _ = clamp_seam_interval(0.0, 5.0, 5.0, 1.0, 2.0)
+
+        # Assert: 抬到边界即止，不造负时长
+        self.assertAlmostEqual(new_start, 5.0, places=6)
+        self.assertAlmostEqual(new_end, 5.0, places=6)
+        self.assertAlmostEqual(overlap, 4.0, places=6)
+
+    def test_incident_stream_becomes_interval_disjoint(self) -> None:
+        # Arrange: 真实的三个词条（的 / 〖 / 士），含块接缝抖动
+        stream = [("的", 42.580, 42.740), ("〖", 42.700, 42.700), ("士", 42.700, 43.180)]
+
+        # Act: 按 cloud_hotword 的发射顺序逐条钳制（last_emitted 存已输出最大 end）
+        emitted = []
+        max_end = 0.0
+        previous_start, previous_end = 0.0, 0.0
+        for text, start, end in stream:
+            if emitted:
+                start, end, _, _ = clamp_seam_interval(
+                    previous_start, previous_end, max_end, start, end,
+                )
+            emitted.append((text, start, end))
+            previous_start, previous_end = start, end
+            max_end = max(max_end, end)
+
+        # Assert: 每个词条的起点都不早于此前所有词条的 end
+        running_end = 0.0
+        for text, start, end in emitted:
+            self.assertGreaterEqual(start, running_end, f"{text} 的起点早于此前的最大 end")
+            running_end = max(running_end, end)
+
+        # Assert: 「士」的起点已被抬到 42.740，标点补位不会再越到它后面
+        self.assertAlmostEqual(emitted[1][1], 42.740, places=6)
+        self.assertAlmostEqual(emitted[2][1], 42.740, places=6)
 
 
 class NormalizeCallSiteTests(unittest.TestCase):

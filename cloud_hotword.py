@@ -9,6 +9,7 @@ from env_config import server_env
 from fa_timestamp_validation import (
     FA_BOUNDARY_JITTER_SEC,
     FaTimestampError,
+    clamp_seam_interval,
     normalize_fa_interval_overlaps,
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
@@ -21,10 +22,8 @@ from hotword_matching import (
     select_monotonic_chain,
 )
 
-try:
-    import zhconv
-except ImportError:
-    raise ImportError("未找到 zhconv 库，请运行: pip install zhconv")
+# 繁简转换只在本文件之外的 pipeline 分支使用；本分支的 norm 下标必须与切块同源，
+# 故这里不再做 zhconv 改写（改写会改变文本长度，正是 2026-10-18 第 44 章漂移的成因）。
 
 import sys as _sys
 if 'main' not in _sys.modules and '__main__' in _sys.modules:
@@ -79,11 +78,22 @@ PARTIAL_MIN_LEN = 5
 FA_MAX_SEC = 270
 TEXT_RATE_BY_LANG = {"zh": 4.5, "en": 12.5}
 TAIL_TEXT_CAPACITY_FACTOR = 1.8
-# 相邻 chunk 以热词为锚点、文本互相重叠，重叠区由前一个 chunk 输出；但紧随重叠区
-# 之后的词（典型为标点）继承的是当前 chunk 自己的 FA 时间戳。同一段文本在两个不同
-# 音频窗口里各对齐一次，FA 边界存在毫秒级抖动，块接缝处可能出现小幅时间回退。
-# 回退在该阈值内视为正常抖动，输出时钳制为单调并 WARN；超过阈值判定为锚点错位或
-# FA 对齐漂移，Fail-Fast 抛错。
+# 接缝抖动容差（秒）。**只属于热词锚点分块这一条链路**，不是全仓通用规则。
+#
+# 为什么只有它有：相邻 chunk 的文本按热词锚点互相重叠，同一段文本会在两个音频窗口
+# 里各对齐一次；重叠区由前一个 chunk 输出，紧随其后的词（典型为标点）继承当前 chunk
+# 自己的 FA 时间戳。同一个边界的两次估边存在毫秒级差异，块接缝处就会出现时间回退。
+#
+# 判据是**区间**：后一个词的 start 不得早于此前所有已输出词的 end。只比前一项的
+# start/end 会让「标点 end 被抬高、后一个实词起点仍在它之前」漏过去（见
+# `_enforce_seam_monotonicity` 的说明）。回退在该阈值内视为正常抖动，钳制并 WARN；
+# 超过阈值判定为锚点错位或 FA 对齐漂移，Fail-Fast 抛错。
+#
+# 另外两条链路（pipeline 的本地 ASR+FA、纯 FA）按 IPA 游标切文本，每段只对齐一次，
+# 不存在同一段文本的两次估边，因此不套本阈值，只在末尾做点态单调校验。
+# **两条链路的接缝行为不同是有意为之**：压平的前提是重叠来自「同一段文本被对齐两次」，
+# 不是把任何接缝偏差都吸收掉。本仓投产的只有热词这一条；将来若要启用那两条，
+# 先决定用哪条不变式，再谈共用。
 SEAM_JITTER_MAX_SEC = FA_BOUNDARY_JITTER_SEC
 
 # chunk 音频窗口两端各留余量，让 FA 的文本有落点，消除「末端差 0.2s」这类纯
@@ -106,6 +116,42 @@ EN_SCALES = {"hundred": 100, "thousand": 1000, "million": 1000000, "billion": 10
 def _is_punct(ch):
     cat = unicodedata.category(ch)
     return cat.startswith("P") or cat.startswith("S")
+
+
+def _is_match_char(ch):
+    """参与匹配的字符：字母、数字、组合标记。
+
+    与 server 端 TTS 白名单同源（`apps/server/src/shared/utils/text-normalize.ts` 的
+    `isAllowedTtsChar`）：TTS 那份额外保留若干标点，而标点在这里必须删（ASR 不转写停顿）。
+    除此之外两侧保留集逐类别相同 —— 因此 TTS 删掉的字符，这里一定也删。
+
+    不能写成 `not _is_punct(ch)`：那样会漏掉 `C` 组（零宽空格、BOM、控制符），
+    它们是不可见字符，留在归一化结果里就是凭空的参考字。
+
+    版本偏差（已知、可接受）：`unicodedata` 的 Unicode 版本可能落后于 Node 的 ICU
+    （本机 Python 15.0 / Node 17.0）。新版本才分配的生僻码位在这里是 `Cn`，会被删；
+    TTS 侧按新版本认成字母、会保留。影响面是每出现一次差一个字。
+    CJK 扩展 I（U+2EBF0 起）正是这一类：它是汉字，但 Python 15 判 `Cn`。
+    """
+    return unicodedata.category(ch)[0] in ("L", "N", "M")
+
+
+_FULLWIDTH_ALNUM_OFFSET = 0xFEE0
+
+
+def _halfwidth_alnum(ch):
+    """全角字母数字 -> 半角；全角空格 -> 半角空格。标点一律不动。
+
+    必须与 server 端 `normalizeFullwidthAlnum` 逐字相同：TTS 把 `Ａ` 转成 `A` 送合成，
+    参考文本若仍是 `Ａ`，`Ａ`.lower() 得到 `ａ` 而 `A`.lower() 得到 `a`，逐字不等。
+    映射是 1:1，不改变长度，`norm_for_match_with_map` 的下标映射不受影响。
+    """
+    cp = ord(ch)
+    if 0xFF10 <= cp <= 0xFF19 or 0xFF21 <= cp <= 0xFF3A or 0xFF41 <= cp <= 0xFF5A:
+        return chr(cp - _FULLWIDTH_ALNUM_OFFSET)
+    if cp == 0x3000:
+        return " "
+    return ch
 
 
 def _cn_number_repl(m):
@@ -234,9 +280,13 @@ def norm_for_match_with_map(s, lang):
     for text, origin, anchor_first in _normalized_segments(s, lang):
         offset = 0
         for ch in text:
-            if not _is_punct(ch) and not ch.isspace():
-                norm_chars.append(ch.lower())
-                idx_map.append(origin if anchor_first else min(origin + offset, last))
+            half = _halfwidth_alnum(ch)
+            if _is_match_char(half):
+                lowered = half.lower()
+                norm_chars.append(lowered)
+                # lower() 可能产出 2 个码位（U+0130「İ」→「i」+ 组合点），
+                # idx_map 必须按**输出码位**补，否则 norm 比 map 长、其后下标全错位。
+                idx_map.extend([origin if anchor_first else min(origin + offset, last)] * len(lowered))
             offset += 1
     return "".join(norm_chars), idx_map
 
@@ -595,35 +645,29 @@ def _build_chunks(valid_hotwords, full_norm_len, total_duration_ms):
     return chunks
 
 
-def _norm_text_to_orig_map(original_text, lang):
-    """Build mapping: norm_text index -> original_text index.
+def norm_span_to_original_span(norm_to_orig, norm_start, norm_end, original_len):
+    """把 norm 下标区间映射成原文下标区间（左闭右开）。
 
-    Applies the same normalization as norm_for_match (number conversion,
-    punctuation/whitespace removal, lowercase) while maintaining a
-    per-character back-map to the original text positions.
+    映射必须来自 `norm_for_match_with_map`：它的数字改写段整段锚定到原文起点，
+    故下标不随改写长度漂移。禁止用「改写后文本的下标 = 原文下标」的映射 ——
+    `_cn_number_to_digits` 会把「十」改写成「10」等，每个改写点都会让后续位置
+    整体右移，FA 参考文本因此越过 chunk 音频窗口（2026-10-18 第 44 章：漂移 12 字，
+    FA 末词 439.39s 超出 436.68s 窗口）。
     """
-    is_zh = lang == "zh"
-
-    if is_zh:
-        work_text = zhconv.convert(original_text, 'zh-cn')
+    if not norm_to_orig:
+        return 0, original_len
+    start = norm_to_orig[norm_start] if 0 <= norm_start < len(norm_to_orig) else 0
+    # 区间右端取**下一个 norm 字**的原文下标，不是最后一个字的 +1：
+    # 数字改写段（「十二」→「12」）每个 norm 字都锚到段首，+1 会把区间截在段内，
+    # 「十二个士兵」的 norm[0,2) 只能拿回「十」，丢掉「二」，FA 参考文本因此变短。
+    if 0 <= norm_end < len(norm_to_orig):
+        end = norm_to_orig[norm_end]
+    elif norm_to_orig:
+        # 区间走到 norm 末尾：停在最后一个参与匹配的字之后，末尾标点不计入
+        end = norm_to_orig[-1] + 1
     else:
-        work_text = original_text.lower()
-
-    if is_zh:
-        work_text = _cn_number_to_digits(work_text)
-    else:
-        work_text = _en_number_words_to_digits(work_text)
-
-    norm_chars = []
-    idx_map = []
-    for i, ch in enumerate(work_text):
-        if _is_punct(ch) or ch.isspace():
-            continue
-        norm_chars.append(ch)
-        idx_map.append(min(i, len(original_text) - 1))
-
-    norm_text = "".join(norm_chars).lower()
-    return norm_text, idx_map
+        end = original_len
+    return start, end
 
 
 DIAG_SNIPPET_LIMIT = 160
@@ -650,35 +694,57 @@ def describe_reference_region(reference_text, norm_to_orig, start, end, limit=DI
     return _clip_text(reference_text[left:right], limit)
 
 
-def coverage_gap_verdict(missing_chars, physical_duration_ms, asr_end_time_ms, lang):
-    """由「缺失字数」与「音频里没被转写的尾时长」推出成因分流判据。
+GAP_KIND_LABEL = {"leading": "开头", "internal": "中间", "trailing": "结尾"}
 
-    两者按 TEXT_RATE_BY_LANG 换算后对得上，说明音频时长确实容得下这段文本而 ASR 没转出来
-    （ASR 侧问题）；对不上说明音频本身就没这段内容（上游产物缺料）。
+
+def coverage_gap_verdict(missing_chars, physical_duration_ms, asr_end_time_ms, lang, gap_kinds=()):
+    """用白话给出「缺这段字」的成因判断，不出现内部指标名。
+
+    尾部未转写时长只能解释**结尾**缺段。开头/中间缺段不能拿它推断成因：
+    第 8 章是中间缺 240 字，尾部只差 0.21s，旧文案却把原因写成「缺尾段」，
+    把排查方向引到音频结尾（2026-10-18 实测：实际是 TTS 在中间复读、吞掉了正文）。
+
+    `gap_kinds` 是 offenders 的缺失类别（leading / internal / trailing）。
     """
     if missing_chars <= 0:
-        return "缺失面为零"
+        return "没有缺失。"
     uncovered_tail_sec = (physical_duration_ms - asr_end_time_ms) / 1000.0
-    expected_tail_sec = missing_chars / TEXT_RATE_BY_LANG[lang]
     if uncovered_tail_sec < 0:
         return (
-            f"ASR 末词时间戳 {-uncovered_tail_sec:.2f}s 超出音频结尾——时间戳与音频本身矛盾，"
-            f"先查 Cloud ASR 返回的 words 时间轴，再谈缺失的 {missing_chars} 字"
+            f"ASR 最后一个字比音频结尾还晚 {-uncovered_tail_sec:.2f}s，时间轴本身矛盾。"
+            "先查 ASR 返回的逐字时间。"
         )
+    kinds = {kind for kind in gap_kinds if kind}
+    if kinds == {"trailing"}:
+        expected_tail_sec = missing_chars / TEXT_RATE_BY_LANG[lang]
+        if uncovered_tail_sec <= COVERAGE_TAIL_SILENCE_MS / 1000.0:
+            return (
+                f"ASR 已经转写到音频结尾（最后 {uncovered_tail_sec:.2f}s 没有字），没有提前截断。\n"
+                "缺的文字最可能不在音频里：先查上游 TTS 产物是否漏读。"
+            )
+        if uncovered_tail_sec >= expected_tail_sec * 0.5:
+            return (
+                f"音频结尾有 {uncovered_tail_sec:.2f}s 没有转写；缺的 {missing_chars} 字按语速约需 "
+                f"{expected_tail_sec:.2f}s，时长对得上。\n"
+                "最可能是 ASR 截断或漏转，音频可能完整。"
+            )
+        return (
+            f"音频结尾有 {uncovered_tail_sec:.2f}s 没有转写，但缺的 {missing_chars} 字按语速只需 "
+            f"{expected_tail_sec:.2f}s，多出的静音无法解释。\n"
+            "参考文本可能比音频长（多了尾注或未合成内容）。"
+        )
+
+    # 开头/中间缺段：结尾还剩多少秒说明不了成因
     if uncovered_tail_sec <= COVERAGE_TAIL_SILENCE_MS / 1000.0:
         return (
-            f"ASR 末词已走到音频结尾（未转写尾 {uncovered_tail_sec:.2f}s）→ "
-            f"音频本身不含这段文本：查上游 TTS 产物是否缺尾段，不要查 ASR"
-        )
-    if uncovered_tail_sec >= expected_tail_sec * 0.5:
-        return (
-            f"音频尾部有 {uncovered_tail_sec:.2f}s 未被转写，缺失文本按 {TEXT_RATE_BY_LANG[lang]} 字/s "
-            f"约需 {expected_tail_sec:.2f}s → 时长对得上：疑 Cloud ASR 截断/漏转该段，"
-            f"音频可能是完整的"
+            f"ASR 转写一直覆盖到音频结尾（最后 {uncovered_tail_sec:.2f}s 没有字），没有提前截断。\n"
+            f"缺的 {missing_chars} 字没有出现在转写里。先听音频这一段，确认是否漏读、复读或改读。\n"
+            "音频确认无误后，再查 ASR。"
         )
     return (
-        f"音频尾部有 {uncovered_tail_sec:.2f}s 未被转写，但缺失文本只需约 {expected_tail_sec:.2f}s → "
-        f"多出的静音无法解释：参考文本比音频长（多余尾注/未合成内容），查送进来的 prompt"
+        f"音频结尾还有 {uncovered_tail_sec:.2f}s 没有转写。缺的是开头或中间的文字，"
+        "结尾还剩多少秒不能解释它。\n"
+        "先对照音频核对这一段。"
     )
 
 
@@ -689,26 +755,51 @@ def format_coverage_diagnosis(
     """覆盖率校验的人读诊断，日志与异常共用这一份文本，禁止两处措辞分叉。
 
     缺失区段的 `text` 已在 coverage 内由调用方的 describe 回调渲染成原文片段。
+    文案面向调用方（不懂服务内部指标）：不出现 refLen / matched / refNorm / 流尾 等词。
     """
     offenders = coverage.get("offenders", [])
     missing_chars = sum(item["length"] for item in offenders)
+    gap_kinds = [item.get("kind") for item in offenders if item.get("kind")]
+    ref_len = coverage.get("referenceLength", 0)
+    asr_len = coverage.get("asrLength", 0)
+    # 两个提前返回分支的 offenders 为空，不能走「缺了 N 字」的模板
+    if ref_len == 0:
+        return "参考文本为空，没有可对齐的文字。"
+    if asr_len == 0:
+        return (
+            f"ASR 没有转写出任何文字（参考文本 {ref_len} 个有效字）。\n"
+            "音频可能没有语音，或 ASR 服务异常；先查 ASR 返回结果。"
+        )
+    matched = coverage.get("matchedLength", 0)
+    ratio = coverage.get("coverageRatio", 0.0)
+    allowed = coverage.get("allowedGap", 0)
+    kinds_text = "、".join(dict.fromkeys(GAP_KIND_LABEL.get(kind, kind) for kind in gap_kinds))
     lines = [
-        f"refLen={coverage.get('referenceLength', 0)} | asrLen={coverage.get('asrLength', 0)} | "
-        f"matched={coverage.get('matchedLength', 0)} | ratio={coverage.get('coverageRatio', 0):.4f} | "
-        f"leading={coverage.get('leadingGap', 0)} | internal={coverage.get('internalGap', 0)} | "
-        f"trailing={coverage.get('trailingGap', 0)} | allowed={coverage.get('allowedGap', 0)}",
-        f"音频={physical_duration_ms / 1000.0:.2f}s | ASR末词={asr_end_time_ms / 1000.0:.2f}s | "
-        f"缺失合计={missing_chars}字",
-        f"判据: {coverage_gap_verdict(missing_chars, physical_duration_ms, asr_end_time_ms, lang)}",
+        f"音频与参考文本对不上：{kinds_text}缺了 {missing_chars} 字。",
+        f"参考文本 {ref_len} 个有效字；ASR 转写 {asr_len} 个有效字，能对上 {matched} 个（{ratio:.1%}）。",
+        "「有效字」= 去掉标点、空格，并把中文数字转成阿拉伯数字后的字。",
+        f"单段缺失超过 {allowed} 字才判失败。",
     ]
     for item in offenders:
+        label = GAP_KIND_LABEL.get(item["kind"], item["kind"])
+        start_number = item["start"] + 1  # 内部下标从 0 起，展示改成从 1 起
+        clip_note = "（该段较长，下面只显示首尾各 80 字）" if item["length"] > DIAG_SNIPPET_LIMIT else ""
         lines.append(
-            f"缺失[{item['kind']}] refNorm[{item['start']}..{item['end']}]（{item['length']}字）: "
-            f"「{item['text']}」"
+            f"缺失位置：{label}，从第 {start_number} 个有效字到第 {item['end']} 个，共 {item['length']} 字。"
         )
+        lines.append(f"这一段原文{clip_note}：「{item['text']}」")
+    lines.append(
+        f"音频时长 {physical_duration_ms / 1000.0:.2f}s；"
+        f"ASR 最后一个字在 {asr_end_time_ms / 1000.0:.2f}s。"
+    )
+    lines.append(
+        "判断："
+        + coverage_gap_verdict(missing_chars, physical_duration_ms, asr_end_time_ms, lang, gap_kinds)
+    )
     if asr_norm_text:
         lines.append(
-            f"ASR 流尾: 「{_clip_text(asr_norm_text, DIAG_SNIPPET_LIMIT, from_tail=True)}」"
+            f"ASR 转写结尾 {DIAG_SNIPPET_LIMIT} 个有效字（对照用）："
+            f"「{_clip_text(asr_norm_text, DIAG_SNIPPET_LIMIT, from_tail=True)}」"
         )
     return "\n".join(lines)
 
@@ -793,8 +884,12 @@ class CloudHotwordAlignPipeline:
             req_id=req_id,
         )
 
-        # 变量名与 FA 路径的 ref_idx_map（含繁简转换，另一套归一化）刻意分开：两者下标空间不同
-        reference_norm, diag_idx_map = norm_for_match_with_map(clean_reference_text, run_lang)
+        # 覆盖率诊断与 FA 参考文本共用这一份映射：它必须与切块偏移同源（同一份
+        # norm_for_match_with_map）。数字改写段（十→10、两百→200）整段锚定到原文起点，
+        # 故 norm 下标回映射原文不漂移；若另用「改写后文本下标 = 原文下标」的映射，
+        # 每次改写都会让后续位置整体右移（2026-10-18 第 44 章：漂移 12 字 →
+        # FA 参考文本越过音频窗口 3.1s，被判成伪对齐）。
+        reference_norm, ref_idx_map = norm_for_match_with_map(clean_reference_text, run_lang)
         asr_norm, _ = build_asr_stream(words, run_lang, norm_for_match)
         coverage = assess_reference_coverage(
             clean_reference_text,
@@ -802,7 +897,7 @@ class CloudHotwordAlignPipeline:
             run_lang,
             norm_for_match,
             describe=lambda start, end: describe_reference_region(
-                clean_reference_text, diag_idx_map, start, end
+                clean_reference_text, ref_idx_map, start, end
             ),
         )
         coverage_diagnosis = format_coverage_diagnosis(
@@ -813,15 +908,13 @@ class CloudHotwordAlignPipeline:
                 ["━━━ ASR 文本覆盖不足 ━━━"] + coverage_diagnosis.split("\n"),
                 req_id=req_id, level="ERROR",
             )
-            raise ValueError(
-                f"音频与参考文本覆盖不一致: {', '.join(coverage['reasons'])}\n"
-                f"{coverage_diagnosis}\n"
-                f"参考文本尾: 「{_clip_text(clean_reference_text, DIAG_SNIPPET_LIMIT, from_tail=True)}」"
-            )
+            # 异常文案直接用人读诊断：不拼内部指标名与 reason code，
+            # 调用方（WebUI / 节点错误面板）读到的就是完整解释。
+            raise ValueError(coverage_diagnosis)
 
         log_info(
-            f"ASR 文本覆盖 OK | ratio={coverage['coverageRatio']:.4f} | "
-            f"internal={coverage['internalGap']} | allowed={coverage['allowedGap']}",
+            f"ASR 文本覆盖 OK | 覆盖率={coverage['coverageRatio']:.1%} | "
+            f"中间缺失={coverage['internalGap']} 字 | 单段容差={coverage['allowedGap']} 字",
             req_id=req_id,
         )
 
@@ -906,8 +999,6 @@ class CloudHotwordAlignPipeline:
         if not chunks:
             raise ValueError("热词切块结果为空，无法进行 FA 对齐。")
 
-        norm_ref, ref_idx_map = _norm_text_to_orig_map(clean_reference_text, run_lang)
-
         verbose_json = {
             "task": "transcribe",
             "language": run_lang,
@@ -931,11 +1022,9 @@ class CloudHotwordAlignPipeline:
             audio_start_sec = chunk["audioStartMs"] / 1000.0
             audio_end_sec = chunk["audioEndMs"] / 1000.0
 
-            orig_start = ref_idx_map[text_start_norm] if text_start_norm < len(ref_idx_map) else 0
-            if text_end_norm - 1 < len(ref_idx_map):
-                orig_end = ref_idx_map[text_end_norm - 1] + 1
-            else:
-                orig_end = len(clean_reference_text)
+            orig_start, orig_end = norm_span_to_original_span(
+                ref_idx_map, text_start_norm, text_end_norm, len(clean_reference_text)
+            )
 
             ground_truth = clean_reference_text[orig_start:orig_end]
             if not ground_truth.strip():
@@ -1024,7 +1113,10 @@ class CloudHotwordAlignPipeline:
                     "end": end,
                 })
                 word_origins.append(chunk_origin)
-                last_emitted = (start, end, w["text"], chunk_origin)
+                # 已输出最大 end 必须随流累积，不能只看上一项：标点被抬高的 end
+                # 要压住紧随其后的实词起点。
+                max_emitted_end = end if last_emitted is None else max(last_emitted[2], end)
+                last_emitted = (start, end, max_emitted_end, w["text"], chunk_origin)
             fa_text_parts.extend(w.text for w in fa_res[fa_start:])
             emitted_orig_end = max(emitted_orig_end, orig_end)
 
@@ -1084,37 +1176,53 @@ class CloudHotwordAlignPipeline:
             )
 
     def _enforce_seam_monotonicity(self, word_text, start, end, origin, last_emitted, req_id):
-        """强制跨 chunk 输出单调，吸收块接缝处的 FA 时间戳抖动。
+        """强制跨 chunk 输出时间单调，并保证相邻词条的时间区间不重叠。
 
-        重叠文本在相邻两个 chunk 里各对齐一次：重叠区本身由前一个 chunk 输出，
-        但紧随重叠区之后的词（典型为标点，继承当前块 FA 的前词 end）来自当前 chunk
-        的对齐，两者存在毫秒级差异，接缝处可能出现小幅时间回退。
-        回退 <= SEAM_JITTER_MAX_SEC 视为正常抖动，钳制到前项边界并 WARN；
+        只用于热词分块链路：只有这条链路按热词锚点切出重叠文本、把同一段对齐两次。
+        pipeline 的本地 ASR+FA 与纯 FA 按游标切文本、每段只对齐一次，不调用本方法。
+
+        重叠区由前一个 chunk 输出，但紧随其后的词（典型为标点，继承当前块 FA 的前词
+        end）来自当前 chunk 的对齐，两者存在毫秒级差异，接缝处可能出现小幅时间回退。
+
+        不变式是「每个词条的 start >= 之前所有已输出词条的 end」。只比前一项的
+        start/end 不够：标点补位会把前一项的 end 抬到它自己的 start 之后，紧随其后的
+        实词起点仍可能落在该 end 之前。此时点态单调成立、区间却重叠，下游按
+        「前词 end 补位」重建标点时就会变成时间回退（2026-10-17 第 4 章事故：
+        的 42.580..42.740 来自 chunk[1]，士 42.700..43.180 来自 chunk[2]）。
+
+        漂移 <= SEAM_JITTER_MAX_SEC 视为正常抖动，钳制到已输出最大 end 并 WARN；
         超过阈值判定为锚点错位/FA 漂移，Fail-Fast 抛错。
+        last_emitted = (start, end, 已输出最大 end, text, origin)。
         返回 (start, end, clamped)。
         """
         if last_emitted is None:
             return start, end, False
-        p_start, p_end, p_word, p_origin = last_emitted
-        regression = max(p_start - start, p_end - end)
-        if regression <= 0:
+        p_start, p_end, p_max_end, p_word, p_origin = last_emitted
+
+        new_start, new_end, overlap, regression = clamp_seam_interval(
+            p_start, p_end, p_max_end, start, end
+        )
+        if overlap <= 0 and regression <= 0:
             return start, end, False
-        if regression > SEAM_JITTER_MAX_SEC:
+
+        drift = max(overlap, regression)
+        if drift > SEAM_JITTER_MAX_SEC:
             message = (
-                f"❌ 跨 chunk 接缝时间戳回退超容差 | 回退={regression:.3f}s "
-                f"(容差={SEAM_JITTER_MAX_SEC}s) | "
-                f"前项'{p_word}' {p_start:.3f}..{p_end:.3f}s 来源={p_origin} | "
+                f"❌ 跨 chunk 接缝时间戳回退超容差 | 起点重叠={overlap:.3f}s | "
+                f"点态回退={regression:.3f}s (容差={SEAM_JITTER_MAX_SEC}s) | "
                 f"当前'{word_text}' {start:.3f}..{end:.3f}s 来源={origin} | "
+                f"前项'{p_word}' {p_start:.3f}..{p_end:.3f}s，此前最大 end={p_max_end:.3f}s "
+                f"来源={p_origin} | "
                 f"可能原因: 热词锚点(beginTime/endTime)错位或该段 FA 对齐漂移"
             )
             log_error(message, req_id=req_id)
             raise FaTimestampError(message)
-        new_start = max(start, p_start)
-        new_end = max(end, p_end)
+
         log_warn(
-            f"块接缝时间戳抖动钳制 | 回退={regression:.3f}s | "
+            f"块接缝时间戳钳制 | 起点重叠={overlap:.3f}s | 点态回退={regression:.3f}s | "
             f"'{word_text}' {start:.3f}..{end:.3f}s -> {new_start:.3f}..{new_end:.3f}s | "
-            f"前项'{p_word}' 来源={p_origin} | 当前来源={origin}",
+            f"前项'{p_word}' {p_start:.3f}..{p_end:.3f}s，此前最大 end={p_max_end:.3f}s "
+            f"来源={p_origin} | 当前来源={origin}",
             req_id=req_id,
         )
         return new_start, new_end, True
