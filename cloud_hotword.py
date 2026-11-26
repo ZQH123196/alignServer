@@ -7,6 +7,7 @@ import requests
 import Levenshtein
 from env_config import server_env
 from fa_timestamp_validation import (
+    FA_BOUNDARY_JITTER_SEC,
     FaTimestampError,
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
@@ -29,10 +30,10 @@ if 'main' not in _sys.modules and '__main__' in _sys.modules:
     _sys.modules['main'] = _sys.modules['__main__']
 from main import log, log_info, log_warn, log_error, log_block, get_task_info
 
-# Cloud ASR (qwen-audio-3.0-asr-flash-filetrans 等) 的语言代码契约。
+# Cloud ASR (qwen-audio-3.1-asr-flash-filetrans 等) 的语言代码契约。
 # 来源：https://platform.qianwenai.com/docs/api-reference/speech-recognition/fun-asr-recording/restful-api
 #
-# 适用模型：qwen-audio-3.0-asr-flash-filetrans, fun-asr, fun-asr-2025-11-07,
+# 适用模型：qwen-audio-3.1-asr-flash-filetrans, fun-asr, fun-asr-2025-11-07,
 #           fun-asr-mtl, fun-asr-mtl-2025-08-25
 # 官方支持的语言代码（parameters.language）：
 #   zh 中文, en 英文, ja 日语, ko 韩语, vi 越南语, th 泰语, id 印尼语,
@@ -65,7 +66,7 @@ def resolve_language(language_code):
     return lang_key
 
 DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/api/v1"
-CLOUD_ASR_MODEL = "qwen-audio-3.0-asr-flash-filetrans"
+CLOUD_ASR_MODEL = "qwen-audio-3.1-asr-flash-filetrans"
 CLOUD_ASR_ENDPOINT = f"{DASHSCOPE_BASE}/services/audio/asr/transcription"
 
 HOTWORD_WEIGHT = 4
@@ -82,7 +83,12 @@ TAIL_TEXT_CAPACITY_FACTOR = 1.8
 # 音频窗口里各对齐一次，FA 边界存在毫秒级抖动，块接缝处可能出现小幅时间回退。
 # 回退在该阈值内视为正常抖动，输出时钳制为单调并 WARN；超过阈值判定为锚点错位或
 # FA 对齐漂移，Fail-Fast 抛错。
-SEAM_JITTER_MAX_SEC = 0.5
+SEAM_JITTER_MAX_SEC = FA_BOUNDARY_JITTER_SEC
+
+# chunk 音频窗口两端各留余量，让 FA 的文本有落点，消除「末端差 0.2s」这类纯
+# 边界抖动（ASR 锚点 vs FA 边界）。真伪对齐（文本远超音频）余量盖不住，仍会
+# 被窗口容差/覆盖闸门抓住。与接缝容差同源，避免同一种物理量出现两把标尺。
+FA_CHUNK_PAD_SEC = FA_BOUNDARY_JITTER_SEC
 
 CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
 CN_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
@@ -538,40 +544,51 @@ def _build_chunks(valid_hotwords, full_norm_len, total_duration_ms):
     if not valid_hotwords:
         return []
 
+    pad_ms = int(FA_CHUNK_PAD_SEC * 1000)
+
+    def _window(audio_start_ms, audio_end_ms):
+        return (
+            max(0, audio_start_ms - pad_ms),
+            min(total_duration_ms, audio_end_ms + pad_ms),
+        )
+
     chunks = []
     idx = 0
 
     first = valid_hotwords[0]
     if first["offsetInFullNorm"] > 0:
+        audio_start_ms, audio_end_ms = _window(0, first["endTime"])
         chunks.append({
             "index": idx,
             "textStart": 0,
             "textEnd": first["offsetInFullNorm"] + len(first["normText"]),
-            "audioStartMs": 0,
-            "audioEndMs": first["endTime"],
+            "audioStartMs": audio_start_ms,
+            "audioEndMs": audio_end_ms,
         })
         idx += 1
 
     for i in range(len(valid_hotwords) - 1):
         cur = valid_hotwords[i]
         nxt = valid_hotwords[i + 1]
+        audio_start_ms, audio_end_ms = _window(cur["beginTime"], nxt["endTime"])
         chunks.append({
             "index": idx,
             "textStart": cur["offsetInFullNorm"],
             "textEnd": nxt["offsetInFullNorm"] + len(nxt["normText"]),
-            "audioStartMs": cur["beginTime"],
-            "audioEndMs": nxt["endTime"],
+            "audioStartMs": audio_start_ms,
+            "audioEndMs": audio_end_ms,
         })
         idx += 1
 
     last = valid_hotwords[-1]
     if last["offsetInFullNorm"] + len(last["normText"]) < full_norm_len:
+        audio_start_ms, audio_end_ms = _window(last["beginTime"], total_duration_ms)
         chunks.append({
             "index": idx,
             "textStart": last["offsetInFullNorm"],
             "textEnd": full_norm_len,
-            "audioStartMs": last["beginTime"],
-            "audioEndMs": total_duration_ms,
+            "audioStartMs": audio_start_ms,
+            "audioEndMs": audio_end_ms,
         })
 
     return chunks
@@ -1042,11 +1059,17 @@ class CloudHotwordAlignPipeline:
 
     def _assert_fa_timestamps(self, fa_res, chunk_start, chunk_end, chunk_idx, req_id):
         try:
-            validate_fa_timestamps_in_chunk(fa_res, chunk_start, chunk_end)
+            overflow = validate_fa_timestamps_in_chunk(fa_res, chunk_start, chunk_end)
         except FaTimestampError as err:
             message = f"{err} | chunk[{chunk_idx}]"
             log_error(message, req_id=req_id)
             raise
+        if overflow:
+            log_warn(
+                f"FA 时间戳小幅越界已放行 | chunk[{chunk_idx}] | 越界={overflow:+.3f}s | "
+                f"窗口={chunk_start:.3f}..{chunk_end:.3f}s | 跨模型边界抖动，非伪对齐",
+                req_id=req_id,
+            )
 
     def _enforce_seam_monotonicity(self, word_text, start, end, origin, last_emitted, req_id):
         """强制跨 chunk 输出单调，吸收块接缝处的 FA 时间戳抖动。

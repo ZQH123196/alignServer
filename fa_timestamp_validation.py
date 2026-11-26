@@ -1,6 +1,18 @@
 import math
 
 
+# 跨模型边界抖动容差（秒）：chunk 窗口由 ASR 词时间戳推出，FA 是另一个模型，
+# 两者对同一个词边界的估计天然有毫秒级偏差。接缝路径已用同一量级吸收
+# （cloud_hotword.SEAM_JITTER_MAX_SEC），chunk 内窗口校验不得比它更严。
+FA_BOUNDARY_JITTER_SEC = 0.5
+
+# 长 chunk 追加的相对越界容差：越界不超过 chunk 时长的此比例时放行。
+# 长 chunk 的语音速率与参考文本可能有百分级偏差，纯绝对容差会把这种良性偏差
+# 误判成伪对齐；但比例容差必须封顶，否则越长的 chunk 越难判死。
+FA_WINDOW_OVERFLOW_RATIO = 0.05
+FA_WINDOW_OVERFLOW_MAX_SEC = 2.0
+
+
 class FaTimestampError(ValueError):
     """FA timestamps are invalid within a chunk or across the final output."""
 
@@ -17,12 +29,23 @@ def _read_label(item):
     return getattr(item, "text", "")
 
 
-def validate_fa_timestamps_in_chunk(word_alignments, chunk_start, chunk_end, tolerance=0.05):
-    """Validate relative FA timestamps before applying the chunk offset."""
+def validate_fa_timestamps_in_chunk(word_alignments, chunk_start, chunk_end, tolerance=FA_BOUNDARY_JITTER_SEC):
+    """Validate relative FA timestamps before applying the chunk offset.
+
+    返回带符号的窗口越界量（秒）：正数表示对齐末端超出窗口，负数表示起点早于窗口。
+    越界在容差内视为跨模型边界抖动，放行并返回该值供调用方告警；超出容差才抛错，
+    因为那说明文本与音频真的不匹配（FA 伪对齐），不是抖动。
+
+    容差 = max(tolerance, min(chunk 时长 * FA_WINDOW_OVERFLOW_RATIO, FA_WINDOW_OVERFLOW_MAX_SEC))。
+    """
     if not word_alignments:
-        return
+        return 0.0
 
     chunk_duration = chunk_end - chunk_start
+    window_tolerance = max(
+        tolerance,
+        min(chunk_duration * FA_WINDOW_OVERFLOW_RATIO, FA_WINDOW_OVERFLOW_MAX_SEC),
+    )
     previous = None
     for index, current in enumerate(word_alignments):
         start = float(_read_timestamp(current, "start_time"))
@@ -50,15 +73,22 @@ def validate_fa_timestamps_in_chunk(word_alignments, chunk_start, chunk_end, tol
 
     relative_start = min(float(_read_timestamp(word, "start_time")) for word in word_alignments)
     relative_end = max(float(_read_timestamp(word, "end_time")) for word in word_alignments)
-    if relative_start < -tolerance or relative_end > chunk_duration + tolerance:
+    if relative_start < -window_tolerance or relative_end > chunk_duration + window_tolerance:
         raise FaTimestampError(
             f"FA 时间戳超出 chunk 音频窗口 | "
             f"chunk={chunk_start:.3f}..{chunk_end:.3f}s "
-            f"(duration={chunk_duration:.3f}s) | "
+            f"(duration={chunk_duration:.3f}s, 容差={window_tolerance:.3f}s) | "
             f"FA relative={relative_start:.3f}..{relative_end:.3f}s | "
             f"FA absolute={chunk_start + relative_start:.3f}.."
             f"{chunk_start + relative_end:.3f}s"
         )
+
+    overflow = 0.0
+    if relative_start < 0:
+        overflow = relative_start
+    if relative_end - chunk_duration > abs(overflow):
+        overflow = relative_end - chunk_duration
+    return overflow
 
 
 def validate_absolute_timestamps(words, origins=None):

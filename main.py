@@ -254,6 +254,7 @@ boot(f"启动配置校验通过 | 目标监听 {SERVER_ENV.host}:{SERVER_ENV.por
 # [修改点 1]：引入我们新定义的 AlignmentThresholdError
 from pipeline import LongAudioAlignPipeline, AlignmentThresholdError, build_sampling_params
 from cloud_hotword import CloudHotwordAlignPipeline, resolve_language as resolve_cloud_language
+from fa_timestamp_validation import FaTimestampError
 boot("业务模块导入完成 | 组装 FastAPI 应用")
 
 CONFIG = {
@@ -281,7 +282,7 @@ VALID_ASR_MODELS = [
     "Qwen3-ASR-0.6B"
 ]
 VALID_CLOUD_HOTWORD_MODELS = [
-    "qwen-audio-3.0-asr-flash-filetrans + Qwen3-ForcedAligner-0.6B",
+    "qwen-audio-3.1-asr-flash-filetrans + Qwen3-ForcedAligner-0.6B",
 ]
 CLOUD_HOTWORD_SUPPORTED_LANGUAGES = {"zh", "en"}
 
@@ -534,6 +535,20 @@ async def openai_asr_endpoint(
                     log_queue_snapshot(req_id=req_id, level="WARN")
                     log_warn(str(e), req_id=req_id)
                     raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "alignment_threshold_error"}})
+
+                except FaTimestampError as e:
+                    # 运行期 FA 对齐失败（时间戳校验未通过）：不是请求参数问题，
+                    # 但同一输入确定性复现，重试无意义，故返回 400 并给专属 type。
+                    # 与 AlignmentThresholdError 同处置，不再走通用 ValueError 分支
+                    # 被误标成「前置闸门」。
+                    mark_failed(req_id)
+                    first_line = str(e).split("\n", 1)[0]
+                    log_error(
+                        f"⚠️ FA 对齐失败（时间戳校验未通过） | {first_line}",
+                        req_id=req_id,
+                    )
+                    log_queue_snapshot(req_id=req_id, level="ERROR")
+                    raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "fa_timestamp_error"}})
 
                 except Exception as e:
                     is_oom = False

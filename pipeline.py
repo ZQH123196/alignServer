@@ -1267,10 +1267,16 @@ class LongAudioAlignPipeline:
     def _assert_fa_timestamps_in_chunk(self, word_alignments, chunk_start, chunk_end, req_id="Unknown"):
         """Reject invalid FA timestamps before they can be converted to absolute time."""
         try:
-            validate_fa_timestamps_in_chunk(word_alignments, chunk_start, chunk_end)
+            overflow = validate_fa_timestamps_in_chunk(word_alignments, chunk_start, chunk_end)
         except FaTimestampError as err:
             log_error(f"❌ {err}", req_id=req_id)
             raise
+        if overflow:
+            log_warn(
+                f"FA 时间戳小幅越界已放行 | 窗口={chunk_start:.3f}..{chunk_end:.3f}s | "
+                f"越界={overflow:+.3f}s | 跨模型边界抖动，非伪对齐",
+                req_id=req_id,
+            )
 
     def _fa_search_bounds(self, is_head, chunk_audio, clean_reference_text, run_lang, chunk_dur, req_id="Unknown", diag_out=None, asr_char_count=None):
         """

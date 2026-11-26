@@ -284,7 +284,7 @@ echo "[*] 开始配置 Web 服务信息 (默认绑定 127.0.0.1:6008)..."
 SERVER_HOST="127.0.0.1"
 SERVER_PORT="6008"
 
-# cloud ASR 分支（qwen-audio-3.0-asr-flash-filetrans）所需；main.py 启动期强校验，缺失即拒绝启动
+# cloud ASR 分支（qwen-audio-3.1-asr-flash-filetrans）所需；main.py 启动期强校验，缺失即拒绝启动
 read -p "🔑 请输入百炼 API Key (dashscope_apikey，可直接回车沿用环境变量或稍后手工写入 .env): " DASHSCOPE_APIKEY
 DASHSCOPE_APIKEY="${DASHSCOPE_APIKEY:-${dashscope_apikey:-}}"
 
