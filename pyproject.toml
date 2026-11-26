@@ -4,45 +4,60 @@ version = "0.1.0"
 description = "Long audio alignment pipeline using VAD, ASR (Qwen3), and FA with FastAPI Server"
 requires-python = ">=3.12"
 
-# 基础必须依赖 (业务逻辑强相关 + Web服务强相关)
+# ===================== 版本纪律 =====================
+# 直接依赖一律写死 ==，整棵依赖树由 uv.lock 钉死。
+# 装环境只允许 `uv sync --frozen`，由 autoInstall.sh 执行。
+# 禁止裸跑 `uv pip install <包名>`：那会绕过锁、静默改版本，正是历史事故的成因。
+# 升级流程见 README.md「依赖版本纪律」，禁止手改本节版本号后不回跑 uv lock。
+# =================================================
 dependencies = [
-    "soundfile>=0.12.1",
-    "zhconv>=1.4.3",
-    "Levenshtein>=0.25.1",       # 底层为 C 的高性能比对引擎
-    "python-dotenv>=1.0.1",      # 用于自动加载 .env 环境变量
-    "psutil>=5.0.0",             # 动态内存监控与探针
-    "transformers>=4.40.0",      # Qwen 模型基础依赖
-    "accelerate>=0.30.0",        # 模型设备映射与加速
-    "qwen-asr @ https://github.com/QwenLM/Qwen3-ASR/archive/refs/heads/main.zip",
-    "silero-vad>=5.1.0",         # [新增] 改用 pip 托管官方 VAD 库
-    # Web 服务与 UI 依赖
-    "fastapi>=0.100.0",          
-    "uvicorn>=0.23.0",           
-    "python-multipart>=0.0.6",   # 用于解析 OpenAI 的表单数据
-    "gradio>=4.0.0",             # 可视化调试 UI
-    "epitran>=1.35.2",
-    "requests>=2.28.0",
+    # —— 音频与文本处理 ——
+    "soundfile==0.14.0",
+    "zhconv==1.4.3",
+    "Levenshtein==0.27.5",       # 底层为 C 的高性能比对引擎，供 hotword_matching 使用
+    "epitran==1.35.3",           # IPA 转换；依赖系统 flite
+    # —— 配置与运行时探针 ——
+    "python-dotenv==1.2.4",      # 加载 .env
+    "psutil==7.2.2",             # 容器 CPU/内存探针，供并发度推算
+    # —— 模型 ——
+    # transformers/accelerate 的版本由 qwen-asr 硬钉（==4.57.6 / ==1.12.0），
+    # 本项目必须与之一致，否则 Qwen3-ASR 的 modeling 代码会加载失败。
+    "transformers==4.57.6",
+    "accelerate==1.12.0",
+    # 上游仓库无 tag。原声明指向 main 分支的实时快照，每次安装代码都可能不同，
+    # 属无法复现的依赖。已钉到具体 commit；升级须人工改此 commit 并重跑 uv lock。
+    "qwen-asr @ https://github.com/QwenLM/Qwen3-ASR/archive/7c6daf77a2421100f5fb066495372c00129d39ff.zip",
+    "silero-vad==6.2.3",
+    # —— Web 服务 ——
+    "fastapi==0.143.0",
+    "uvicorn==0.54.0",
+    "python-multipart==0.0.32",  # OpenAI 兼容接口的表单解析
+    "requests==2.34.2",
+    # —— 硬件 ——
+    # torch 是 silero-vad 的硬依赖，故进基础依赖而非 optional。
+    # 锁文件只能钉版本，钉不了二进制变体：CPU 与 CUDA 构建版本号相同。
+    # 故本锁文件按 GPU（默认 index 上的 CUDA 构建）生成，是本项目的主部署形态；
+    # CPU 变体由安装脚本在 CPU 场景下从 PyTorch CPU index 装同名版本，
+    # 装完由 env_config.check_device_capability 验证结果，不靠人工确认。
+    # 注意：曾尝试用 [tool.uv.sources] 的 marker 按 extra 路由两种变体，
+    # 实测 uv 一旦为 torch 声明 source，lock 会把两个变体都解析到该 index，marker 失效。
+    "torch==2.14.1",
+    "torchaudio==2.11.0",
 ]
 
-# 可选环境依赖 (通过 pip install -e ".[环境名]" 安装)
 [project.optional-dependencies]
-# 硬件平台
-GPU = ["torch", "torchaudio"]
-CPU = ["torch", "torchaudio"]
+# 大模型下载工具，二选一：hf = 官方 / ms = 国内魔搭
+hf = ["huggingface-hub[cli]==0.36.2"]
+ms = ["modelscope==1.40.2"]
 
-# 下载生态
-hf = ["huggingface_hub[cli]"]    # 国外 hf 命令行
-ms = ["modelscope"]              # 国内 ModelScope
+[dependency-groups]
+dev = ["pytest==9.0.2"]
 
 [tool.uv]
 package = false
-override-dependencies = ["numba>=0.60.0"]
+# numba 由 librosa 间接引入，上游声明过松，已覆盖为精确版本。
+override-dependencies = ["numba==0.68.0"]
 
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchaudio = { index = "pytorch-cpu" }
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]

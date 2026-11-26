@@ -40,7 +40,12 @@ from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 
-from env_config import StartupConfigError, load_server_env
+from env_config import (
+    StartupConfigError,
+    check_device_capability,
+    check_lockfile,
+    load_server_env,
+)
 from utils import get_container_cpu_count, get_container_available_memory
 import transformers
 transformers.logging.set_verbosity_error()
@@ -242,14 +247,20 @@ def log_fatal(*args, queue: bool = False, **kw) -> None:
     log(*args, level="FATAL", queue=queue, **kw)
 
 
-# 启动即校验环境变量与本地模型目录：配置不完整直接拒绝启动，不留到请求中途炸。
-# 放在业务模块导入之前 —— 校验失败时无需先付 torch/transformers 的导入代价。
+# 启动即校验环境变量、依赖锁与硬件能力：任一项不通过都直接拒绝启动，
+# 不留到请求中途炸。放在业务模块导入之前 —— 校验失败时无需先付 pipeline 的导入代价。
+_HARDWARE_RECEIPT = ""
 try:
     SERVER_ENV = load_server_env()
+    _startup_problems: list[str] = []
+    check_lockfile(_startup_problems)
+    _HARDWARE_RECEIPT = check_device_capability(SERVER_ENV.device, _startup_problems)
+    if _startup_problems:
+        raise StartupConfigError(_startup_problems)
 except StartupConfigError as config_error:
-    log_block(["启动配置检查未通过，服务拒绝启动"] + config_error.problems, level="FATAL")
+    log_block(["启动检查未通过，服务拒绝启动"] + config_error.problems, level="FATAL")
     sys.exit(1)
-boot(f"启动配置校验通过 | 目标监听 {SERVER_ENV.host}:{SERVER_ENV.port} | 导入对齐 pipeline（静默阶段）...")
+boot(f"启动检查通过 | 目标监听 {SERVER_ENV.host}:{SERVER_ENV.port} | 导入对齐 pipeline（静默阶段）...")
 
 # [修改点 1]：引入我们新定义的 AlignmentThresholdError
 from pipeline import LongAudioAlignPipeline, AlignmentThresholdError, build_sampling_params
@@ -316,7 +327,7 @@ async def lifespan(app: FastAPI):
     global pipeline_instance, cloud_pipeline_instance, gpu_semaphore
     
     log_info("服务初始化中...")
-    log_block(["启动配置"] + SERVER_ENV.describe())
+    log_block(["启动配置"] + SERVER_ENV.describe() + ([_HARDWARE_RECEIPT] if _HARDWARE_RECEIPT else []))
     boot("正在加载本地模型权重（Silero VAD + Qwen3-ASR + ForcedAligner，静默阶段）...")
     load_at = _time.time()
     pipeline_instance = LongAudioAlignPipeline(CONFIG)
