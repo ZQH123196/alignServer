@@ -11,8 +11,8 @@ AUDIO_FILE="test_asr_zh.wav"
 # 注意：这里默认你的服务运行在本地 6008 端口。如果有变，请修改这里。
 API_URL="http://127.0.0.1:6008/v1/audio/transcriptions"
 
-# 💡【核心新增】：对齐模式必须指定合法的 ForcedAligner 模型名称
-MODEL="Qwen/Qwen3-ForcedAligner-0.6B"
+# ASR+对齐模式：先用 ASR 定位文本边界，再用 ForcedAligner 输出时间戳
+MODEL="Qwen/Qwen3-ASR-0.6B + Qwen/Qwen3-ForcedAligner-0.6B"
 PROMPT_TEXT="甚至出现，交易几乎停滞的情况。"
 
 # ==========================================

@@ -218,7 +218,7 @@ def log_fatal(*args, queue: bool = False, **kw) -> None:
 
 # [修改点 1]：引入我们新定义的 AlignmentThresholdError
 from pipeline import LongAudioAlignPipeline, AlignmentThresholdError, build_sampling_params
-from cloud_hotword import CloudHotwordAlignPipeline
+from cloud_hotword import CloudHotwordAlignPipeline, resolve_language as resolve_cloud_language
 
 load_dotenv()
 
@@ -236,10 +236,10 @@ cloud_pipeline_instance = None
 gpu_semaphore = None
 
 VALID_ALIGNMENT_MODELS = [
-    "Qwen/Qwen3-ForcedAligner-0.6B-hf", 
-    "Qwen/Qwen3-ForcedAligner-0.6B", 
-    "Qwen3-ForcedAligner-0.6B-hf", 
-    "Qwen3-ForcedAligner-0.6B"
+    "Qwen/Qwen3-ASR-0.6B + Qwen/Qwen3-ForcedAligner-0.6B",
+]
+VALID_FA_ONLY_MODELS = [
+    "Qwen/Qwen3-ForcedAligner-0.6B",
 ]
 VALID_ASR_MODELS = [
     "Qwen/Qwen3-ASR-0.6B-hf", 
@@ -343,7 +343,7 @@ app = FastAPI(lifespan=lifespan, title="Long Audio Aligner API")
 @app.post("/v1/audio/transcriptions")
 async def openai_asr_endpoint(
     file: UploadFile = File(..., description="要处理的音频文件"),
-    model: str = Form(..., description="强制要求：必须指定合法的 ForcedAligner 或 ASR 模型名称"),
+    model: str = Form(..., description="必须指定合法的 ASR、ASR+ForcedAligner 或 ForcedAligner 模型名称"),
     prompt: str = Form(default="", description="对齐模式(FA)必填，纯ASR模式选填/忽略"),
     response_format: str = Form(default="json", description="支持 json 或 verbose_json"),
     language: str = Form(default=None, description="语言"),
@@ -355,10 +355,13 @@ async def openai_asr_endpoint(
     
     req_id = str(uuid.uuid4())[:8]
     is_alignment_mode = (model in VALID_ALIGNMENT_MODELS)
+    is_fa_only_mode = (model in VALID_FA_ONLY_MODELS)
     is_cloud_hotword_mode = (model in VALID_CLOUD_HOTWORD_MODELS)
     if is_cloud_hotword_mode:
         mode_str = "CloudHotword"
     elif is_alignment_mode:
+        mode_str = "ASR+ForcedAligner"
+    elif is_fa_only_mode:
         mode_str = "ForcedAligner"
     else:
         mode_str = "ASR"
@@ -373,18 +376,24 @@ async def openai_asr_endpoint(
 
     tmp_path = None
     try:
-        valid_models = VALID_ALIGNMENT_MODELS + VALID_ASR_MODELS + VALID_CLOUD_HOTWORD_MODELS
+        valid_models = (
+            VALID_ALIGNMENT_MODELS
+            + VALID_FA_ONLY_MODELS
+            + VALID_ASR_MODELS
+            + VALID_CLOUD_HOTWORD_MODELS
+        )
         if model not in valid_models:
             mark_failed(req_id)
             raise HTTPException(status_code=400, detail={"error": {"message": f"Bad Request: Unsupported model '{model}'.", "type": "invalid_request_error"}})
 
         if is_cloud_hotword_mode:
-            lang_key = (language or "").lower().strip().split("-")[0].split("_")[0]
-            if lang_key not in CLOUD_HOTWORD_SUPPORTED_LANGUAGES:
+            try:
+                resolve_cloud_language(language)
+            except ValueError as lang_err:
                 mark_failed(req_id)
-                raise HTTPException(status_code=400, detail={"error": {"message": f"Cloud hotword 分支仅支持中文(zh)和英文(en)，当前语言 '{language}' 不支持。", "type": "invalid_request_error"}})
+                raise HTTPException(status_code=400, detail={"error": {"message": str(lang_err), "type": "invalid_request_error"}})
 
-        if is_alignment_mode or is_cloud_hotword_mode:
+        if is_alignment_mode or is_fa_only_mode or is_cloud_hotword_mode:
             if not prompt or not prompt.strip():
                 mark_failed(req_id)
                 raise HTTPException(status_code=400, detail={"error": {"message": "The 'prompt' parameter is required.", "type": "invalid_request_error"}})
@@ -436,6 +445,14 @@ async def openai_asr_endpoint(
                                 result = await run_in_threadpool(
                                     pipeline_instance.process_audio, audio_path=tmp_path, reference_text=prompt, language_code=language, req_id=req_id
                                 )
+                            elif is_fa_only_mode:
+                                result = await run_in_threadpool(
+                                    pipeline_instance.process_audio_fa_only,
+                                    audio_path=tmp_path,
+                                    reference_text=prompt,
+                                    language_code=language,
+                                    req_id=req_id,
+                                )
                             else:
                                 sampling_params = build_sampling_params(
                                     pipeline_instance.asr_model,
@@ -463,7 +480,7 @@ async def openai_asr_endpoint(
                             )
                             log_queue_snapshot(req_id=req_id)
                             
-                            if not is_alignment_mode and not is_cloud_hotword_mode and response_format == "json":
+                            if not is_alignment_mode and not is_fa_only_mode and not is_cloud_hotword_mode and response_format == "json":
                                 return {"text": result.get("text", "")}
                             return result
                         finally:

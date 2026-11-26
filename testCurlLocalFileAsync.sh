@@ -7,7 +7,7 @@ set -e
 # ==========================================
 API_URL="http://127.0.0.1:6008/v1/audio/transcriptions"
 AUDIO_FILE="./testAudio.wav"
-MODEL="Qwen/Qwen3-ForcedAligner-0.6B"
+MODEL="Qwen/Qwen3-ASR-0.6B + Qwen/Qwen3-ForcedAligner-0.6B"
 
 # 🚀【并发配置】
 CONCURRENCY=5          # 设定并发请求数

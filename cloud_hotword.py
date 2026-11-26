@@ -5,6 +5,11 @@ import unicodedata
 import requests
 
 import Levenshtein
+from fa_timestamp_validation import (
+    FaTimestampError,
+    validate_absolute_timestamps,
+    validate_fa_timestamps_in_chunk,
+)
 
 try:
     import zhconv
@@ -16,7 +21,40 @@ if 'main' not in _sys.modules and '__main__' in _sys.modules:
     _sys.modules['main'] = _sys.modules['__main__']
 from main import log, log_info, log_warn, log_error, log_block, get_task_info
 
+# Cloud ASR (qwen-audio-3.0-asr-flash-filetrans 等) 的语言代码契约。
+# 来源：https://platform.qianwenai.com/docs/api-reference/speech-recognition/fun-asr-recording/restful-api
+#
+# 适用模型：qwen-audio-3.0-asr-flash-filetrans, fun-asr, fun-asr-2025-11-07,
+#           fun-asr-mtl, fun-asr-mtl-2025-08-25
+# 官方支持的语言代码（parameters.language）：
+#   zh 中文, en 英文, ja 日语, ko 韩语, vi 越南语, th 泰语, id 印尼语,
+#   ms 马来语, tl 菲律宾语, hi 印地语, ar 阿拉伯语, fr 法语, de 德语,
+#   es 西班牙语, pt 葡萄牙语, ru 俄语, it 意大利语, nl 荷兰语, sv 瑞典语,
+#   da 丹麦语, fi 芬兰语, no 挪威语, el 希腊语, pl 波兰语, cs 捷克语,
+#   hu 匈牙利语, ro 罗马尼亚语, bg 保加利亚语, hr 克罗地亚语, sk 斯洛伐克语
+#
+# 本分支当前仅放行 zh / en；未来扩展其他语言时，把目标代码加入
+# SUPPORTED_LANGUAGES 即可（热词提取/归一化目前只对中英做了专门适配，
+# 其余语言需先验证 extract_hotwords / norm_for_match 的行为）。
 SUPPORTED_LANGUAGES = {"zh", "en"}
+
+LANGUAGE_ALIASES = {
+    "chinese": "zh",
+    "english": "en",
+}
+
+
+def resolve_language(language_code):
+    """Resolve language code/alias to zh or en. Raises ValueError for unsupported."""
+    lang = (language_code or "").lower().strip()
+    lang_key = lang.split("-")[0].split("_")[0]
+    lang_key = LANGUAGE_ALIASES.get(lang_key, lang_key)
+    if lang_key not in SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"Cloud hotword 分支仅支持中文(zh)和英文(en)，"
+            f"当前语言 '{language_code}' 不支持。请使用本地模型分支处理其他语言。"
+        )
+    return lang_key
 
 DASHSCOPE_BASE = "https://dashscope.aliyuncs.com/api/v1"
 CLOUD_ASR_MODEL = "qwen-audio-3.0-asr-flash-filetrans"
@@ -29,6 +67,8 @@ HOTWORDS_PER_CHUNK = 3
 PARTIAL_MATCH_RATIO = 0.8
 PARTIAL_MIN_LEN = 5
 FA_MAX_SEC = 270
+TEXT_RATE_BY_LANG = {"zh": 4.5, "en": 12.5}
+TAIL_TEXT_CAPACITY_FACTOR = 1.8
 
 CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
 CN_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
@@ -188,7 +228,7 @@ def extract_hotwords(txt_content, lang):
 
     candidates.sort(key=lambda c: c["offset"])
 
-    rate = 4.5 if is_zh else 12.5
+    rate = TEXT_RATE_BY_LANG["zh" if is_zh else "en"]
     total_chars = len(full_norm)
     est_duration_sec = total_chars / rate
     num_segments = max(1, int(est_duration_sec / CHUNK_SEC) + (1 if est_duration_sec % CHUNK_SEC else 0))
@@ -521,15 +561,7 @@ class CloudHotwordAlignPipeline:
 
     def process_audio(self, audio_path, reference_text, language_code=None, req_id="Unknown"):
         pipeline_start_time = time.time()
-        run_lang = (language_code or self.config.get("language", "zh")).lower().strip()
-
-        lang_key = run_lang.split("-")[0].split("_")[0]
-        if lang_key not in SUPPORTED_LANGUAGES:
-            raise ValueError(
-                f"Cloud hotword 分支仅支持中文(zh)和英文(en)，"
-                f"当前语言 '{language_code}' 不支持。请使用本地模型分支处理其他语言。"
-            )
-        run_lang = lang_key
+        run_lang = resolve_language(language_code or self.config.get("language", "zh"))
 
         clean_reference_text = re.sub(r'[ \t\r\f\v]+', ' ', reference_text).strip()
 
@@ -552,51 +584,7 @@ class CloudHotwordAlignPipeline:
 
         words = _extract_words(transcription)
         asr_text = _transcript_text(transcription)
-        total_duration_ms = words[-1].get("end_time", 0) if words else 0
-        total_audio_duration = total_duration_ms / 1000.0
-
-        log_info(
-            f"ASR 结果 | words={len(words)} | 时长={total_audio_duration:.1f}s | 文本={len(asr_text)}字",
-            req_id=req_id,
-        )
-
-        full_norm = norm_for_match(clean_reference_text, run_lang)
-        matched, partial_matched, unmatched, duplicate_in_asr = _match_hotwords(
-            hotwords, words, run_lang, full_norm
-        )
-        all_matched = matched + partial_matched
-
-        log_block([
-            "━━━ 热词匹配诊断 ━━━",
-            f"  精确匹配: {len(matched)} | 退化匹配(≥80%): {len(partial_matched)} | "
-            f"未匹配: {len(unmatched)} | ASR内重复: {len(duplicate_in_asr)}",
-        ] + ([f"  未匹配热词: {' | '.join(h['text'] for h in unmatched)}"] if unmatched else []),
-            req_id=req_id, level="INFO")
-
-        valid, discarded = _enforce_monotonicity(all_matched)
-        if discarded:
-            log_warn(f"单调性丢弃: {len(discarded)} 个热词", req_id=req_id)
-
-        chunks = _build_chunks(valid, len(full_norm), total_duration_ms)
-        log_info(f"切块: {len(chunks)} 个", req_id=req_id)
-
-        if not chunks:
-            raise ValueError("热词切块结果为空，无法进行 FA 对齐。")
-
-        norm_ref, ref_idx_map = _norm_text_to_orig_map(clean_reference_text, run_lang)
-
-        verbose_json = {
-            "task": "transcribe",
-            "language": run_lang,
-            "duration": round(total_audio_duration, 2),
-            "report": {},
-            "text": "",
-            "words": [],
-        }
-
-        fa_text_parts = []
-        all_word_alignments = []
-        fa_diag = []
+        asr_end_time_ms = words[-1].get("end_time", 0) if words else 0
 
         import soundfile as sf
         import torch
@@ -613,6 +601,112 @@ class CloudHotwordAlignPipeline:
             import torchaudio.functional as F
             wav = F.resample(wav, sample_rate, 16000)
             sample_rate = 16000
+
+        physical_audio_duration = len(wav) / sample_rate
+        physical_duration_ms = physical_audio_duration * 1000
+        asr_duration_sec = asr_end_time_ms / 1000.0
+        if abs(asr_duration_sec - physical_audio_duration) > 0.05:
+            log_warn(
+                f"ASR/物理音频时长差异 | ASR末词={asr_duration_sec:.3f}s | "
+                f"物理音频={physical_audio_duration:.3f}s | "
+                f"差异={physical_audio_duration - asr_duration_sec:+.3f}s",
+                req_id=req_id,
+            )
+
+        log_info(
+            f"ASR 结果 | words={len(words)} | ASR末词={asr_duration_sec:.1f}s | "
+            f"音频={physical_audio_duration:.1f}s | 文本={len(asr_text)}字",
+            req_id=req_id,
+        )
+
+        full_norm = norm_for_match(clean_reference_text, run_lang)
+        matched, partial_matched, unmatched, duplicate_in_asr = _match_hotwords(
+            hotwords, words, run_lang, full_norm
+        )
+        all_matched = matched + partial_matched
+
+        log_block([
+            "━━━ 热词匹配诊断 ━━━",
+            f"  精确匹配: {len(matched)} | 退化匹配(≥80%): {len(partial_matched)} | "
+            f"未匹配: {len(unmatched)} | ASR内重复: {len(duplicate_in_asr)}",
+        ] + ([
+            "  未匹配热词: " + " | ".join(
+                f"{h['text']}@norm[{h['offsetInFullNorm']}]" for h in unmatched
+            )
+        ] if unmatched else []),
+            req_id=req_id, level="INFO")
+
+        valid, discarded = _enforce_monotonicity(all_matched)
+        if discarded:
+            log_warn(f"单调性丢弃: {len(discarded)} 个热词", req_id=req_id)
+
+        # The ASR last-word timestamp can omit trailing audio. The decoded
+        # file duration is the authoritative end boundary for the tail chunk.
+        # If the last matched anchor is too late, the remaining reference text
+        # can be much longer than the tail audio. Qwen FA extrapolates timestamps
+        # for this case instead of clamping them to the supplied audio window.
+        effective_valid = list(valid)
+        removed_tail_anchors = []
+        first_tail_capacity_issue = None
+        text_rate = TEXT_RATE_BY_LANG[run_lang]
+        while len(effective_valid) > 1:
+            candidate_chunks = _build_chunks(
+                effective_valid, len(full_norm), physical_duration_ms
+            )
+            if not candidate_chunks:
+                break
+
+            tail = candidate_chunks[-1]
+            tail_audio_sec = (tail["audioEndMs"] - tail["audioStartMs"]) / 1000.0
+            tail_text_len = tail["textEnd"] - tail["textStart"]
+            if tail["textEnd"] != len(full_norm) or tail_audio_sec <= 0:
+                break
+
+            max_tail_text_len = tail_audio_sec * text_rate * TAIL_TEXT_CAPACITY_FACTOR
+            if tail_text_len <= max_tail_text_len:
+                break
+
+            if first_tail_capacity_issue is None:
+                first_tail_capacity_issue = (
+                    tail_text_len, tail_audio_sec, max_tail_text_len
+                )
+            removed_tail_anchors.append(effective_valid.pop())
+
+        if removed_tail_anchors:
+            tail_text_len, tail_audio_sec, max_tail_text_len = first_tail_capacity_issue
+            log_warn(
+                f"尾块文本容量不足 | norm字数={tail_text_len} | "
+                f"音频={tail_audio_sec:.3f}s | 估算容量={max_tail_text_len:.1f}字 | "
+                f"合并前移 {len(removed_tail_anchors)} 个尾锚点 | "
+                f"移除锚点: "
+                + " | ".join(
+                    f"{h['text']}@{h['beginTime'] / 1000:.3f}s"
+                    for h in removed_tail_anchors
+                ),
+                req_id=req_id,
+            )
+
+        chunks = _build_chunks(effective_valid, len(full_norm), physical_duration_ms)
+        log_info(f"切块: {len(chunks)} 个", req_id=req_id)
+
+        if not chunks:
+            raise ValueError("热词切块结果为空，无法进行 FA 对齐。")
+
+        norm_ref, ref_idx_map = _norm_text_to_orig_map(clean_reference_text, run_lang)
+
+        verbose_json = {
+            "task": "transcribe",
+            "language": run_lang,
+            "duration": round(physical_audio_duration, 2),
+            "report": {},
+            "text": "",
+            "words": [],
+        }
+
+        fa_text_parts = []
+        all_word_alignments = []
+        fa_diag = []
+        emitted_orig_end = 0
 
         for chunk in chunks:
             text_start_norm = chunk["textStart"]
@@ -631,6 +725,14 @@ class CloudHotwordAlignPipeline:
                 continue
 
             chunk_dur = audio_end_sec - audio_start_sec
+            if chunk["index"] == chunks[-1]["index"]:
+                log_info(
+                    f"FA 尾部输入 | chunk[{chunk['index']}] | "
+                    f"音频={audio_start_sec:.3f}..{audio_end_sec:.3f}s ({chunk_dur:.3f}s) | "
+                    f"原文norm={text_start_norm}:{text_end_norm} ({text_end_norm - text_start_norm}字) | "
+                    f"ground_truth={orig_start}:{orig_end} ({len(ground_truth)}字)",
+                    req_id=req_id,
+                )
             if chunk_dur > FA_MAX_SEC:
                 log_warn(
                     f"⚠️ chunk[{chunk['index']}] 时长 {chunk_dur:.1f}s 超过 FA 上限 {FA_MAX_SEC}s，截断",
@@ -642,6 +744,22 @@ class CloudHotwordAlignPipeline:
             start_sample = max(0, int(audio_start_sec * sample_rate))
             end_sample = min(len(wav), int(audio_end_sec * sample_rate))
             chunk_audio = (wav[start_sample:end_sample].numpy(), sample_rate)
+            actual_chunk_dur = (end_sample - start_sample) / sample_rate
+            if abs(actual_chunk_dur - chunk_dur) > 0.05:
+                raise ValueError(
+                    f"chunk 实际音频长度异常 | chunk[{chunk['index']}] "
+                    f"requested={chunk_dur:.3f}s | actual={actual_chunk_dur:.3f}s | "
+                    f"samples={end_sample - start_sample} | "
+                    f"window={audio_start_sec:.3f}..{audio_end_sec:.3f}s"
+                )
+
+            if chunk["index"] == chunks[-1]["index"]:
+                log_info(
+                    f"FA 尾部实际输入 | chunk[{chunk['index']}] | "
+                    f"requested={chunk_dur:.3f}s | actual={actual_chunk_dur:.3f}s | "
+                    f"samples={end_sample - start_sample}",
+                    req_id=req_id,
+                )
 
             try:
                 with self.fa_lock:
@@ -650,19 +768,27 @@ class CloudHotwordAlignPipeline:
                 log_error(f"FA 对齐失败 | chunk[{chunk['index']}] | {err}", req_id=req_id)
                 raise
 
-            self._assert_fa_timestamps(fa_res, chunk_dur, chunk["index"], req_id)
+            self._assert_fa_timestamps(
+                fa_res, audio_start_sec, audio_end_sec, chunk["index"], req_id
+            )
 
             for w in fa_res:
                 all_word_alignments.append(w)
-                fa_text_parts.append(w.text)
 
             rebuilt_words = self._rebuild_words(ground_truth, fa_res, run_lang)
-            for w in rebuilt_words:
+            overlap_end = max(emitted_orig_end, orig_start)
+            keep_from = max(0, overlap_end - orig_start)
+            kept_words, fa_start = self._trim_rebuilt_words(
+                ground_truth, rebuilt_words, keep_from, run_lang
+            )
+            for w in kept_words:
                 verbose_json["words"].append({
                     "word": w["text"],
                     "start": round(audio_start_sec + w["start"], 3),
                     "end": round(audio_start_sec + w["end"], 3),
                 })
+            fa_text_parts.extend(w.text for w in fa_res[fa_start:])
+            emitted_orig_end = max(emitted_orig_end, orig_end)
 
             fa_diag.append(
                 f"chunk[{chunk['index']}] {audio_start_sec:.1f}-{audio_end_sec:.1f}s ({chunk_dur:.1f}s) "
@@ -671,6 +797,8 @@ class CloudHotwordAlignPipeline:
 
         uses_character_tokens = run_lang == "zh"
         verbose_json["text"] = "".join(fa_text_parts) if uses_character_tokens else " ".join(fa_text_parts)
+
+        self._validate_subtitle_timestamps(verbose_json["words"], req_id=req_id)
 
         norm_result = norm_for_match(verbose_json["text"], run_lang)
         ratio = Levenshtein.ratio(full_norm, norm_result)
@@ -688,32 +816,56 @@ class CloudHotwordAlignPipeline:
             "📊 最终报告 (Cloud Hotword 对齐模式)",
             f"文件名       : {file_name}",
             f"执行状态     : ✅ 成功 (相似度: {verbose_json['report']['accuracy_ratio']})",
-            f"热词         : {len(hotwords)} 个 | 有效锚点: {len(valid)} | 切块: {len(chunks)}",
-            f"音频时长     : {total_audio_duration:.2f}s",
+            f"热词         : {len(hotwords)} 个 | 有效锚点: {len(effective_valid)} | 切块: {len(chunks)}",
+            f"音频时长     : {physical_audio_duration:.2f}s",
             f"流水线耗时   : {total_pipeline_time:.2f}s",
-            f"RTF          : {total_pipeline_time / total_audio_duration:.3f}" if total_audio_duration > 0 else "RTF: N/A",
+            f"RTF          : {total_pipeline_time / physical_audio_duration:.3f}" if physical_audio_duration > 0 else "RTF: N/A",
         ] + fa_diag, req_id=req_id)
 
         return verbose_json
 
-    def _assert_fa_timestamps(self, fa_res, chunk_dur, chunk_idx, req_id):
-        if not fa_res:
-            return
-        tolerance = 0.05
-        relative_start = min(w.start_time for w in fa_res)
-        relative_end = max(w.end_time for w in fa_res)
-        if relative_start < -tolerance or relative_end > chunk_dur + tolerance:
-            raise ValueError(
-                f"FA 时间戳超出 chunk 音频窗口 | chunk[{chunk_idx}] "
-                f"duration={chunk_dur:.3f}s | FA relative={relative_start:.3f}..{relative_end:.3f}s"
-            )
-        for prev, cur in zip(fa_res, fa_res[1:]):
-            if cur.start_time < prev.start_time or cur.end_time < prev.end_time:
-                raise ValueError(
-                    f"FA chunk 内部时间戳非单调 | chunk[{chunk_idx}] | "
-                    f"prev={prev.start_time:.3f}..{prev.end_time:.3f}s | "
-                    f"cur={cur.start_time:.3f}..{cur.end_time:.3f}s"
-                )
+    def _assert_fa_timestamps(self, fa_res, chunk_start, chunk_end, chunk_idx, req_id):
+        try:
+            validate_fa_timestamps_in_chunk(fa_res, chunk_start, chunk_end)
+        except FaTimestampError as err:
+            message = f"{err} | chunk[{chunk_idx}]"
+            log_error(message, req_id=req_id)
+            raise
+
+    def _validate_subtitle_timestamps(self, words, req_id="Unknown"):
+        try:
+            validate_absolute_timestamps(words)
+        except FaTimestampError as err:
+            log_error(f"❌ {err}", req_id=req_id)
+            raise
+        log_info(f"✅ 字幕时间戳校验通过 | {len(words)} 个词条时间单调且满足 start <= end", req_id=req_id)
+
+    def _trim_rebuilt_words(self, ground_truth, rebuilt_words, keep_from, lang):
+        """Drop text already emitted by an overlapping preceding chunk."""
+        uses_character_tokens = lang == "zh"
+        if uses_character_tokens:
+            tokens = list(ground_truth)
+
+            def is_valid_token(tok):
+                return bool(tok) and (tok.isalnum() or unicodedata.category(tok).startswith("L"))
+        else:
+            tokens = re.findall(r'\w+|[^\w]', ground_truth, re.UNICODE)
+
+            def is_valid_token(tok):
+                return bool(tok) and (tok[0].isalnum() or unicodedata.category(tok[0]).startswith("L"))
+
+        kept = []
+        fa_start = 0
+        cursor = 0
+        for token, word in zip(tokens, rebuilt_words):
+            token_end = cursor + len(token)
+            if token_end <= keep_from:
+                if is_valid_token(token):
+                    fa_start += 1
+            else:
+                kept.append(word)
+            cursor = token_end
+        return kept, fa_start
 
     def _rebuild_words(self, ground_truth, fa_words, lang):
         uses_character_tokens = lang == "zh"
