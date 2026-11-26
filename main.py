@@ -217,8 +217,7 @@ def log_fatal(*args, queue: bool = False, **kw) -> None:
 
 
 # [修改点 1]：引入我们新定义的 AlignmentThresholdError
-from pipeline import LongAudioAlignPipeline, AlignmentThresholdError, build_sampling_params
-from cloud_hotword import CloudHotwordAlignPipeline, resolve_language as resolve_cloud_language
+from pipeline import LongAudioAlignPipeline, AlignmentThresholdError
 
 load_dotenv()
 
@@ -232,14 +231,13 @@ CONFIG = {
 }
 
 pipeline_instance = None
-cloud_pipeline_instance = None
 gpu_semaphore = None
 
 VALID_ALIGNMENT_MODELS = [
-    "Qwen/Qwen3-ASR-0.6B + Qwen/Qwen3-ForcedAligner-0.6B",
-]
-VALID_FA_ONLY_MODELS = [
-    "Qwen/Qwen3-ForcedAligner-0.6B",
+    "Qwen/Qwen3-ForcedAligner-0.6B-hf", 
+    "Qwen/Qwen3-ForcedAligner-0.6B", 
+    "Qwen3-ForcedAligner-0.6B-hf", 
+    "Qwen3-ForcedAligner-0.6B"
 ]
 VALID_ASR_MODELS = [
     "Qwen/Qwen3-ASR-0.6B-hf", 
@@ -247,10 +245,6 @@ VALID_ASR_MODELS = [
     "Qwen/Qwen3-ASR-0.6B", 
     "Qwen3-ASR-0.6B"
 ]
-VALID_CLOUD_HOTWORD_MODELS = [
-    "qwen-audio-3.0-asr-flash-filetrans + Qwen3-ForcedAligner-0.6B",
-]
-CLOUD_HOTWORD_SUPPORTED_LANGUAGES = {"zh", "en"}
 
 world_frozen_event = asyncio.Event()
 world_frozen_event.set() 
@@ -279,15 +273,10 @@ async def trigger_frozen_world():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pipeline_instance, cloud_pipeline_instance, gpu_semaphore
+    global pipeline_instance, gpu_semaphore
     
     log_info("服务初始化中...")
     pipeline_instance = LongAudioAlignPipeline(CONFIG)
-    cloud_pipeline_instance = CloudHotwordAlignPipeline(
-        fa_model=pipeline_instance.fa_model,
-        fa_lock=pipeline_instance.fa_lock,
-        config=CONFIG,
-    )
     
     if pipeline_instance.device == "cpu" or not torch.cuda.is_available():
         cores = get_container_cpu_count()
@@ -343,28 +332,16 @@ app = FastAPI(lifespan=lifespan, title="Long Audio Aligner API")
 @app.post("/v1/audio/transcriptions")
 async def openai_asr_endpoint(
     file: UploadFile = File(..., description="要处理的音频文件"),
-    model: str = Form(..., description="必须指定合法的 ASR、ASR+ForcedAligner 或 ForcedAligner 模型名称"),
+    model: str = Form(..., description="强制要求：必须指定合法的 ForcedAligner 或 ASR 模型名称"),
     prompt: str = Form(default="", description="对齐模式(FA)必填，纯ASR模式选填/忽略"),
     response_format: str = Form(default="json", description="支持 json 或 verbose_json"),
-    language: str = Form(default=None, description="语言"),
-    temperature: float = Form(default=None, description="采样温度（0=贪心；>0 采样；仅纯ASR模式生效）"),
-    top_p: float = Form(default=None, description="top-p 采样（可选；仅纯ASR模式生效）"),
-    n: int = Form(default=None, description="一次返回 n 条候选（可选；仅纯ASR模式生效）"),
+    language: str = Form(default=None, description="语言")
 ):
     global active_gpu_requests
     
     req_id = str(uuid.uuid4())[:8]
     is_alignment_mode = (model in VALID_ALIGNMENT_MODELS)
-    is_fa_only_mode = (model in VALID_FA_ONLY_MODELS)
-    is_cloud_hotword_mode = (model in VALID_CLOUD_HOTWORD_MODELS)
-    if is_cloud_hotword_mode:
-        mode_str = "CloudHotword"
-    elif is_alignment_mode:
-        mode_str = "ASR+ForcedAligner"
-    elif is_fa_only_mode:
-        mode_str = "ForcedAligner"
-    else:
-        mode_str = "ASR"
+    mode_str = "ForcedAligner" if is_alignment_mode else "ASR"
     
     # 先入册，再打印"接收请求"，这样第一行日志就已经能看到队列里多了一条 WAITING
     register(req_id, file.filename or "(未命名)", mode_str)
@@ -376,43 +353,18 @@ async def openai_asr_endpoint(
 
     tmp_path = None
     try:
-        valid_models = (
-            VALID_ALIGNMENT_MODELS
-            + VALID_FA_ONLY_MODELS
-            + VALID_ASR_MODELS
-            + VALID_CLOUD_HOTWORD_MODELS
-        )
+        valid_models = VALID_ALIGNMENT_MODELS + VALID_ASR_MODELS
         if model not in valid_models:
             mark_failed(req_id)
             raise HTTPException(status_code=400, detail={"error": {"message": f"Bad Request: Unsupported model '{model}'.", "type": "invalid_request_error"}})
 
-        if is_cloud_hotword_mode:
-            try:
-                resolve_cloud_language(language)
-            except ValueError as lang_err:
-                mark_failed(req_id)
-                raise HTTPException(status_code=400, detail={"error": {"message": str(lang_err), "type": "invalid_request_error"}})
-
-        if is_alignment_mode or is_fa_only_mode or is_cloud_hotword_mode:
+        if is_alignment_mode:
             if not prompt or not prompt.strip():
                 mark_failed(req_id)
                 raise HTTPException(status_code=400, detail={"error": {"message": "The 'prompt' parameter is required.", "type": "invalid_request_error"}})
             if response_format != "verbose_json":
                 mark_failed(req_id)
                 raise HTTPException(status_code=400, detail={"error": {"message": "Only 'verbose_json' response_format is supported.", "type": "invalid_request_error"}})
-            if temperature is not None or top_p is not None or n is not None:
-                mark_failed(req_id)
-                raise HTTPException(status_code=400, detail={"error": {"message": "Sampling params (temperature/top_p/n) are only valid in ASR mode.", "type": "invalid_request_error"}})
-
-        if temperature is not None and not (0.0 <= temperature <= 2.0):
-            mark_failed(req_id)
-            raise HTTPException(status_code=400, detail={"error": {"message": "temperature must be in [0, 2].", "type": "invalid_request_error"}})
-        if top_p is not None and not (0.0 < top_p <= 1.0):
-            mark_failed(req_id)
-            raise HTTPException(status_code=400, detail={"error": {"message": "top_p must be in (0, 1].", "type": "invalid_request_error"}})
-        if n is not None and not (1 <= n <= 10):
-            mark_failed(req_id)
-            raise HTTPException(status_code=400, detail={"error": {"message": "n must be in [1, 10].", "type": "invalid_request_error"}})
 
         suffix = os.path.splitext(file.filename)[1] if file.filename else ".wav"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -437,40 +389,13 @@ async def openai_asr_endpoint(
                         async with gpu_state_lock: active_gpu_requests += 1
                             
                         try:
-                            if is_cloud_hotword_mode:
-                                result = await run_in_threadpool(
-                                    cloud_pipeline_instance.process_audio, audio_path=tmp_path, reference_text=prompt, language_code=language, req_id=req_id
-                                )
-                            elif is_alignment_mode:
+                            if is_alignment_mode:
                                 result = await run_in_threadpool(
                                     pipeline_instance.process_audio, audio_path=tmp_path, reference_text=prompt, language_code=language, req_id=req_id
                                 )
-                            elif is_fa_only_mode:
-                                result = await run_in_threadpool(
-                                    pipeline_instance.process_audio_fa_only,
-                                    audio_path=tmp_path,
-                                    reference_text=prompt,
-                                    language_code=language,
-                                    req_id=req_id,
-                                )
                             else:
-                                sampling_params = build_sampling_params(
-                                    pipeline_instance.asr_model,
-                                    temperature=temperature,
-                                    top_p=top_p,
-                                    n=n,
-                                )
-                                if sampling_params is not None:
-                                    log_info(
-                                        f"🎛️ 采样参数 | temperature={sampling_params.temperature}, top_p={sampling_params.top_p}, n={sampling_params.n}",
-                                        req_id=req_id,
-                                    )
                                 result = await run_in_threadpool(
-                                    pipeline_instance.process_audio_asr_only,
-                                    audio_path=tmp_path,
-                                    language_code=language,
-                                    req_id=req_id,
-                                    sampling_params=sampling_params,
+                                    pipeline_instance.process_audio_asr_only, audio_path=tmp_path, language_code=language, req_id=req_id
                                 )
                                 
                             mark_done(req_id)
@@ -480,7 +405,7 @@ async def openai_asr_endpoint(
                             )
                             log_queue_snapshot(req_id=req_id)
                             
-                            if not is_alignment_mode and not is_fa_only_mode and not is_cloud_hotword_mode and response_format == "json":
+                            if not is_alignment_mode and response_format == "json":
                                 return {"text": result.get("text", "")}
                             return result
                         finally:

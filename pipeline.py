@@ -6,16 +6,10 @@ import Levenshtein
 import soundfile as sf
 import numpy as np
 import threading
-import unicodedata
 
 from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner
 from utils import get_container_cpu_count
 from silero_vad import load_silero_vad, get_speech_timestamps
-from fa_timestamp_validation import (
-    FaTimestampError,
-    validate_absolute_timestamps,
-    validate_fa_timestamps_in_chunk,
-)
 
 # 共享 main.py 的并发可视化日志（log/register/mark_*）—— 任务执行过程打印时
 # 会自动附上时间戳、级别、req_id 与"当前任务队列快照"，方便实时看到并行任务与各自处理的文件。
@@ -85,11 +79,8 @@ class AsrBatchScheduler:
         self._worker = threading.Thread(target=self._flush_loop, name="AsrBatchScheduler", daemon=True)
         self._worker.start()
 
-    def submit(self, audios, language, req_id="Unknown", sampling_params=None):
-        """提交本请求的所有 audio chunks（带采样参数），阻塞直到结果返回。
-
-        sampling_params：可选 vLLM SamplingParams（「生成定调文本（calibration）」温度采样用）；
-        None = 贪心解码。flush 时按采样签名分组，贪心请求不与采样请求混批。
+    def submit(self, audios, language, req_id="Unknown"):
+        """提交本请求的所有 audio chunks，阻塞直到结果返回。
         超过 max_pending_chunks 时分批排队（等前一批消化完再提交下一批），不拒绝。
         """
         if not audios:
@@ -99,12 +90,12 @@ class AsrBatchScheduler:
         offset = 0
         while offset < len(audios):
             batch = audios[offset:offset + self.max_pending_chunks]
-            batch_results = self._submit_batch(batch, language, req_id, sampling_params)
+            batch_results = self._submit_batch(batch, language, req_id)
             results[offset:offset + len(batch)] = batch_results
             offset += len(batch)
         return results
 
-    def _submit_batch(self, audios, language, req_id="Unknown", sampling_params=None):
+    def _submit_batch(self, audios, language, req_id="Unknown"):
         """提交一批 audios（不超过 max_pending_chunks），阻塞等待结果。"""
         if not audios:
             return []
@@ -114,7 +105,7 @@ class AsrBatchScheduler:
         holder = [None]
 
         with self._lock:
-            self._pending.append((audios, language, sampling_params, holder, event, count))
+            self._pending.append((audios, language, holder, event, count))
             self._cv.notify()
 
         event.wait()
@@ -124,116 +115,48 @@ class AsrBatchScheduler:
             raise result
         return result
 
-    @staticmethod
-    def _sampling_signature(sampling_params):
-        """采样参数签名：贪心请求与不同采样参数的请求不得混批。"""
-        if sampling_params is None:
-            return "greedy"
-        return (sampling_params.temperature, sampling_params.top_p, sampling_params.n)
-
     def _flush_loop(self):
-        """单线程 worker：攒批 -> 按采样参数分组 -> 调用 transcribe -> 切分结果 -> 唤醒等待者。"""
+        """单线程 worker：攒批 -> 调用 transcribe -> 切分结果 -> 唤醒等待者。"""
         while True:
             with self._cv:
                 while not self._pending:
                     self._cv.wait()
                 self._cv.wait(timeout=self.max_wait_ms / 1000.0)
 
-                buckets = {}
+                batch = []
+                taken = 0
                 remaining = []
                 for item in self._pending:
-                    audios, lang, sampling, holder, event, count = item
-                    key = self._sampling_signature(sampling)
-                    bucket = buckets.get(key)
-                    if bucket is None:
-                        bucket = {"sampling": sampling, "items": [], "taken": 0}
-                        buckets[key] = bucket
-                    if bucket["taken"] == 0 or bucket["taken"] + count <= self.max_batch_size:
-                        bucket["items"].append(item)
-                        bucket["taken"] += count
+                    count = item[4]
+                    if taken == 0 or taken + count <= self.max_batch_size:
+                        batch.append(item)
+                        taken += count
                     else:
                         remaining.append(item)
                 self._pending = remaining
 
-            if not buckets:
+            if not batch:
                 continue
 
-            for bucket in buckets.values():
-                batch = bucket["items"]
-                all_audios = []
-                all_langs = []
-                for audios, lang, _, _, _, count in batch:
-                    all_audios.extend(audios)
-                    all_langs.extend([lang] * count)
+            all_audios = []
+            all_langs = []
+            for audios, lang, _, _, count in batch:
+                all_audios.extend(audios)
+                all_langs.extend([lang] * count)
 
-                try:
-                    results = self.asr_model.transcribe(
-                        audio=all_audios,
-                        language=all_langs,
-                        sampling_params=bucket["sampling"],
-                    )
-                except Exception as err:
-                    for _, _, _, holder, event, _ in batch:
-                        holder[0] = err
-                        event.set()
-                    continue
-
-                i = 0
-                for _, _, _, holder, event, count in batch:
-                    holder[0] = results[i:i + count]
+            try:
+                results = self.asr_model.transcribe(audio=all_audios, language=all_langs)
+            except Exception as err:
+                for _, _, holder, event, _ in batch:
+                    holder[0] = err
                     event.set()
-                    i += count
+                continue
 
-
-class Qwen3ASRSamplingModel(Qwen3ASRModel):
-    """支持 per-call 解码参数的 Qwen3-ASR 包装。
-
-    背景：qwen_asr v0.0.6 的 transcribe() 不暴露解码参数，vLLM SamplingParams
-    在 from_pretrained() 时写死 temperature=0.0（贪心）。「生成定调文本（calibration）」
-    需要温度采样产生多样候选做共识投票；对齐模式必须保持贪心。
-    AsrBatchScheduler 保证单线程调用 generate()（见其类文档），因此临时替换
-    sampling_params 是安全的。
-    """
-
-    def transcribe(
-        self,
-        audio,
-        context="",
-        language=None,
-        return_time_stamps=False,
-        sampling_params=None,
-    ):
-        if sampling_params is None:
-            return super().transcribe(audio, context, language, return_time_stamps)
-        prev = self.sampling_params
-        self.sampling_params = sampling_params
-        try:
-            return super().transcribe(audio, context, language, return_time_stamps)
-        finally:
-            self.sampling_params = prev
-
-
-def build_sampling_params(asr_model, temperature=None, top_p=None, n=None):
-    """构造 vLLM SamplingParams；任一解码参数给定才构造，全 None 返回 None（贪心）。
-
-    max_tokens 沿用模型初始化时的采样参数，避免新参数覆盖生成长度限制。
-    """
-    if temperature is None and top_p is None and n is None:
-        return None
-    from vllm import SamplingParams
-
-    base = getattr(asr_model, "sampling_params", None)
-    kwargs = {}
-    if temperature is not None:
-        kwargs["temperature"] = temperature
-    if top_p is not None:
-        kwargs["top_p"] = top_p
-    if n is not None:
-        kwargs["n"] = n
-    max_tokens = getattr(base, "max_tokens", None)
-    if max_tokens is not None:
-        kwargs["max_tokens"] = max_tokens
-    return SamplingParams(**kwargs)
+            i = 0
+            for _, _, holder, event, count in batch:
+                holder[0] = results[i:i + count]
+                event.set()
+                i += count
 
 
 class LongAudioAlignPipeline:
@@ -285,7 +208,7 @@ class LongAudioAlignPipeline:
 
         self.vad_model = load_silero_vad() 
         self.get_speech_timestamps = get_speech_timestamps
-        self.asr_model = Qwen3ASRSamplingModel.from_pretrained(asr_path, **model_kwargs)
+        self.asr_model = Qwen3ASRModel.from_pretrained(asr_path, **model_kwargs)
         # Qwen3-ForcedAligner 边缘情况：FA 是强制对齐器，不做文本识别。
         # fa_res.text 永远是输入文本的回声；输入过量/不匹配音频的文本时，
         # FA 仍会给所有词分配时间戳（伪插值），结果毫无价值。
@@ -414,35 +337,18 @@ class LongAudioAlignPipeline:
                 print(f"  Epitran 载入失败 {epitran_code}: {e}")
                 raise ValueError(f"Failed to initialize Epitran for code '{epitran_code}': {e}")
 
-    @staticmethod
-    def _uses_character_tokens(lang):
-        """Return whether the language should be aligned character by character."""
-        key = (lang or "zh").lower().strip().replace("_", "-")
-        return key.startswith(("zh", "cmn", "chinese", "ja", "jpn", "japanese"))
-
-    @staticmethod
-    def _is_chinese_language(lang):
-        key = (lang or "zh").lower().strip().replace("_", "-")
-        return key.startswith(("zh", "cmn", "chinese"))
-
-    @staticmethod
-    def _is_text_character(char):
-        """Keep Unicode letters/numbers while dropping punctuation and symbols."""
-        return char.isalnum() or unicodedata.category(char).startswith("L")
-
     def _normalize_text(self, text, lang="zh"):
-        """Normalize text without assuming that every non-Chinese language is Latin."""
+        """跨语言字符级基础过滤归一化"""
         lang = (lang or "zh").lower().strip()
-        uses_character_tokens = self._uses_character_tokens(lang)
-
-        if uses_character_tokens:
-            text_sim = zhconv.convert(text, 'zh-cn') if self._is_chinese_language(lang) else text
-            text_clean = "".join(char for char in text_sim if self._is_text_character(char))
+        is_chinese = any(kw in lang for kw in ["zh", "chinese", "cmn", "hans", "hant"])
+        
+        if is_chinese:
+            text_sim = zhconv.convert(text, 'zh-cn')
+            text_clean = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text_sim)
         else:
-            # Whitespace-delimited languages retain spaces; Unicode scripts such
-            # as Cyrillic must not be reduced to ASCII before matching.
+            # 西方/非中文语系保留空格，移除绝大多数标点，归一化小写
             text_clean = text.lower()
-            text_clean = "".join(char for char in text_clean if self._is_text_character(char) or char.isspace())
+            text_clean = re.sub(r'[^a-z0-9\s]', '', text_clean)
             text_clean = re.sub(r'\s+', ' ', text_clean).strip()
         return text_clean
 
@@ -455,19 +361,19 @@ class LongAudioAlignPipeline:
         idx_map = [] # 记录 norm_text 的每个字在 original_text 中的索引
         
         lang = (lang or "zh").lower().strip()
-        uses_character_tokens = self._uses_character_tokens(lang)
+        is_chinese = any(kw in lang for kw in ["zh", "chinese", "cmn", "hans", "hant"])
         
         # 1. 物理对齐 norm_text 与 original_text 的索引
-        if uses_character_tokens:
-            sim_text = zhconv.convert(original_text, 'zh-cn') if self._is_chinese_language(lang) else original_text
+        if is_chinese:
+            sim_text = zhconv.convert(original_text, 'zh-cn')
             for i, char in enumerate(sim_text):
-                if self._is_text_character(char):
+                if re.match(r'[\u4e00-\u9fa5a-zA-Z0-9]', char):
                     norm_chars.append(char)
                     idx_map.append(i)
         else:
             orig_lower = original_text.lower()
             for i, char in enumerate(orig_lower):
-                if self._is_text_character(char) or char.isspace():
+                if re.match(r'[a-z0-9\s]', char):
                     norm_chars.append(char)
                     idx_map.append(i)
 
@@ -484,7 +390,7 @@ class LongAudioAlignPipeline:
             return norm_text, norm_text, list(range(len(norm_text))), idx_map
 
         # Epitran 以词为单位进行音素编译效率最高
-        words = list(norm_text) if uses_character_tokens else norm_text.split()
+        words = norm_text.split(" ") if not is_chinese else list(norm_text)
         
         current_search_offset = 0  # [新增] 维护一个全局向前推进的搜索游标
         
@@ -492,7 +398,7 @@ class LongAudioAlignPipeline:
             # 将单词编译为 IPA 音素
             word_ipa = epi.transliterate(word)
             # 记录当前单词在原 norm_text 中的字符索引区间
-            if not uses_character_tokens:
+            if not is_chinese:
                 # [修改] 强制从 current_search_offset 之后开始寻找，防止高频词导致时光倒流
                 norm_word_start = norm_text.find(word, current_search_offset) 
                 if norm_word_start == -1: 
@@ -508,8 +414,8 @@ class LongAudioAlignPipeline:
                 ipa_parts.append(word_ipa)
                 ipa_to_norm_map.extend([norm_word_start] * len(word_ipa))
                 
-            # Whitespace-delimited languages retain word boundaries in IPA.
-            if not uses_character_tokens and word_idx < len(words) - 1:
+            # 西方文字在 IPA 中加空格作为边界
+            if not is_chinese and word_idx < len(words) - 1:
                 ipa_parts.append(" ")
                 # 空格对应原 norm 中的空格
                 ipa_to_norm_map.append(norm_word_start + len(word))
@@ -518,7 +424,7 @@ class LongAudioAlignPipeline:
         return ipa_text, norm_text, ipa_to_norm_map, idx_map
 
     def _hard_match_asr_to_ref(self, asr_text, is_forward, norm_ref, ref_idx_map,
-                                 min_words=1, max_words=8, language=None):
+                                min_words=1, max_words=8):
         """
         ASR 末尾/开头词在归一化原文(norm_ref)里找唯一匹配位置（硬匹配）。
         对称模型：is_forward=True 取 ASR 末尾词前向找（首/中间 chunk），
@@ -538,10 +444,9 @@ class LongAudioAlignPipeline:
         if not asr_text or not norm_ref:
             return None, 0, ""
 
-        uses_character_tokens = self._uses_character_tokens(
-            language or self.config.get("language", "zh")
-        )
-        if uses_character_tokens:
+        is_chinese = any(kw in (self.config.get("language", "zh")).lower()
+                         for kw in ["zh", "chinese", "cmn", "hans", "hant"])
+        if is_chinese:
             asr_words = list(asr_text)
             ref_words = list(norm_ref)
         else:
@@ -558,12 +463,12 @@ class LongAudioAlignPipeline:
                 query = asr_words[-n_words:]
             else:
                 query = asr_words[:n_words]
-            query_str = "".join(query) if uses_character_tokens else " ".join(query)
+            query_str = "".join(query) if is_chinese else " ".join(query)
 
             # 词边界匹配：query 在 norm_ref 里必须出现在词边界处
-            # Character-token languages use direct substring matching.
-            # Word-token languages require whitespace boundaries (防止 "ined" 匹配到 "combined" 中间).
-            if uses_character_tokens:
+            # 中文：字符级，直接子串匹配即可（中文字符本身就是词边界）
+            # 英文：query 前后必须是空格或字符串首尾（防止 "ined" 匹配到 "combined" 中间）
+            if is_chinese:
                 count = norm_ref.count(query_str)
                 if count == 1:
                     norm_pos = norm_ref.find(query_str)
@@ -625,7 +530,7 @@ class LongAudioAlignPipeline:
         max_sec = self.config["chunk_max_sec"]
         min_edge_sec = self.config.get("min_tail_sec", 30)
         text_len = len(clean_reference_text)
-        uses_character_tokens = self._uses_character_tokens(run_lang)
+        is_chinese = any(kw in run_lang.lower() for kw in ["zh", "chinese", "cmn", "hans", "hant"])
 
         # 先按细分片跑 ASR（一次性全跑，后续合并时拼接文本复用）
         seg_audios = []
@@ -655,36 +560,12 @@ class LongAudioAlignPipeline:
             parts = []
             for t in segs_slice:
                 if t: parts.append(t)
-            return "".join(parts) if uses_character_tokens else " ".join(parts)
-
-        def _fa_check_chunk(seg_start, seg_end_exclusive, text_start, text_end):
-            """对候选 chunk 跑 FA 健康度，>= 阈值则通过。"""
-            chunk_s = max(0, int(raw_speech_timestamps[seg_start]['start'] * sample_rate))
-            chunk_e = min(len(wav), int(raw_speech_timestamps[seg_end_exclusive - 1]['end'] * sample_rate))
-            chunk_audio = (wav[chunk_s:chunk_e].numpy(), sample_rate)
-            chunk_dur = raw_speech_timestamps[seg_end_exclusive - 1]['end'] - raw_speech_timestamps[seg_start]['start']
-            gt = clean_reference_text[text_start:text_end]
-            if not gt.strip():
-                return False
-            try:
-                with self.fa_lock:
-                    fa_res = self.fa_model.align(audio=[chunk_audio], text=[gt], language=run_lang)[0]
-                    self._assert_fa_timestamps_in_chunk(
-                        fa_res, raw_speech_timestamps[seg_start]['start'],
-                        raw_speech_timestamps[seg_end_exclusive - 1]['end'], req_id,
-                    )
-                    score = self._evaluate_fa_health(fa_res, chunk_dur, run_lang=run_lang)
-                return score >= self.ASR_FA_HEALTH_THRESHOLD
-            except FaTimestampError:
-                raise
-            except Exception:
-                return False
+            return "".join(parts) if is_chinese else " ".join(parts)
 
         def _greedy_match_forward(seg_start, seg_end_max, cursor_orig):
             """
             前向贪婪：从 seg_start 合并到 seg_end_max，取 ASR 末尾词硬匹配。
             策略：先累加到 max（或 seg_end_max），匹配不到则回退一块重试。
-            硬匹配命中后追加 FA 健康度校验，不通过则继续回退。
             Returns: (seg_end, orig_end, n_words, matched_str) | 失败 (None, None, 0, "")
             """
             # 先累加到 max_sec 或 seg_end_max
@@ -700,20 +581,16 @@ class LongAudioAlignPipeline:
                 combined = _combine_asr(seg_norm_texts[seg_start:end_idx])
                 if not combined.strip(): continue
                 orig_pos, n_words, matched = self._hard_match_asr_to_ref(
-                    combined, is_forward=True, norm_ref=norm_ref, ref_idx_map=ref_idx_map,
-                    language=run_lang,
+                    combined, is_forward=True, norm_ref=norm_ref, ref_idx_map=ref_idx_map
                 )
                 if orig_pos is not None and orig_pos > cursor_orig:
-                    if _fa_check_chunk(seg_start, end_idx, cursor_orig, orig_pos):
-                        return end_idx, orig_pos, n_words, matched
+                    return end_idx, orig_pos, n_words, matched
             return None, None, 0, ""
 
-        def _greedy_match_backward(seg_end_min, seg_end, text_len, text_lower_bound=0):
+        def _greedy_match_backward(seg_end_min, seg_end, text_len):
             """
             反向贪婪：从 seg_end 向首部合并到 seg_end_min，取 ASR 开头词硬匹配。
             策略：先累加到 max（或 seg_end_min），匹配不到则回退一块重试。
-            硬匹配命中后追加 FA 健康度校验，不通过则继续回退。
-            text_lower_bound: 匹配到的 orig_pos 必须 > 此值（防止尾 chunk 匹配到首 chunk 已覆盖区域）。
             Returns: (seg_start, orig_start, n_words, matched_str) | 失败 (None, None, 0, "")
             """
             # 先向首部累加到 max_sec 或 seg_end_min
@@ -728,12 +605,10 @@ class LongAudioAlignPipeline:
                 combined = _combine_asr(seg_norm_texts[start_idx:seg_end])
                 if not combined.strip(): continue
                 orig_pos, n_words, matched = self._hard_match_asr_to_ref(
-                    combined, is_forward=False, norm_ref=norm_ref, ref_idx_map=ref_idx_map,
-                    language=run_lang,
+                    combined, is_forward=False, norm_ref=norm_ref, ref_idx_map=ref_idx_map
                 )
-                if orig_pos is not None and orig_pos < text_len and orig_pos > text_lower_bound:
-                    if _fa_check_chunk(start_idx, seg_end, orig_pos, text_len):
-                        return start_idx, orig_pos, n_words, matched
+                if orig_pos is not None and orig_pos < text_len:
+                    return start_idx, orig_pos, n_words, matched
             return None, None, 0, ""
 
         # ── 首 chunk：从 0 前向贪婪合并，ASR 末尾词硬匹配原文 ──
@@ -747,9 +622,8 @@ class LongAudioAlignPipeline:
 
         # ── 尾 chunk：从末尾反向贪婪合并，ASR 开头词硬匹配原文 ──
         tail_seg_start_min = head_end_idx if head_end_idx else 0
-        tail_text_lower_bound = head_orig_end if head_orig_end else 0
         tail_start_idx, tail_orig_start, tail_n_words, tail_matched = _greedy_match_backward(
-            tail_seg_start_min, n_segs, text_len, text_lower_bound=tail_text_lower_bound
+            tail_seg_start_min, n_segs, text_len
         )
 
         # ── 组装结果 ──
@@ -866,12 +740,12 @@ class LongAudioAlignPipeline:
         """合并多个细分片 ASR 结果为一个（拼接 text，保留 language 字段）。"""
         if not seg_asr_results:
             return None
-        uses_character_tokens = self._uses_character_tokens(run_lang)
+        is_chinese = any(kw in run_lang.lower() for kw in ["zh", "chinese", "cmn", "hans", "hant"])
         parts = []
         for res in seg_asr_results:
             if res and getattr(res, 'text', None):
                 parts.append(res.text)
-            combined_text = "".join(parts) if uses_character_tokens else " ".join(parts)
+        combined_text = "".join(parts) if is_chinese else " ".join(parts)
         first = seg_asr_results[0]
         return type(first)(
             language=getattr(first, 'language', run_lang),
@@ -1175,64 +1049,34 @@ class LongAudioAlignPipeline:
     # 最终裁定阈值（原 FA_HEALTH_THRESHOLD，用于纠偏分支是否采信）
     FINAL_FA_HEALTH_THRESHOLD = 0.5
 
-    def _evaluate_fa_health(self, word_alignments, chunk_audio_duration=None, diag_out=None, run_lang="zh"):
+    def _evaluate_fa_health(self, word_alignments, chunk_audio_duration=None, diag_out=None):
         """
         FA 对齐健康度评估（跨语言/数字/口胡/语速通用）。
 
         信号：
-          - squash_score    : 主信号。挤碎词占比（duration < 20ms，FA 硬塞进静音）
-          - stretch_score   : 主信号。拉伸词占比（duration > stretch_ms，FA 硬拉过非语音段）
+          - squash_score    : 主信号。挤碎词占比（自适应语速阈值）
           - variance_score  : 软辅助。词时长方差过低（线性插值痕迹）
           (coverage 砍掉：FA 时间戳预测可能偏长，last_end 超出 chunk_dur 是 FA 本身特性不是文本不足)
           (start 砍掉：VAD padding 让首词 start_time 正常就有 0.2-0.3s，误杀正常对齐)
 
-        合成：hard = min(squash_score, stretch_score)
+        合成：hard = squash_score
               soft_penalty = 0.7 + 0.3 * variance（variance 极低才温和惩罚）
               return hard * soft_penalty
-
-        阈值按书写系统分两类（与 asyncProxyServer 统一，无需逐语言配置）：
-          - 音节文字（中/日/韩）：FA 按字符对齐，每字 ≈ 1 音节。
-            挤碎 < 20ms/字（物理发音下限），拉伸 > 350ms/字（正常 ~222ms/字 @ 4.5字/秒，
-            350ms = 1.6x 已属异常；500ms 太松会漏掉 FA 拉伸静音段）。
-          - 字母/辅音音素文字（英/俄/阿拉伯/孟加拉等）：FA 按词对齐，词含多音节。
-            挤碎 < 20ms/词，拉伸 > 500ms/词（多音节词如 "international" 正常可达 ~1.2s，
-            但 FA 对齐粒度是词级，500ms 是极慢朗读 ~2 syl/s 的保守下限）。
-
-        物理依据（跨语言通用）：
-          - 挤碎下限 20ms：人类最小发音动作（articulatory gesture：唇闭合、舌抬起）
-            不可能快于 20ms，低于此值的对齐必然是 FA 把字硬塞进静音/间隙。
-          - 拉伸上限：Pellegrino et al. 2011（跨 7 语言）音节速率 4.5-9.1 syl/s → 110-222ms/音节；
-            Cruttenden 2014（英语）~4 syl/s → 250ms/音节；极慢朗读 ~2 syl/s = 500ms/音节。
 
         diag_out: 可选 list，传入则把诊断行 append 进去（供调用方聚合打印）
         """
         if not word_alignments: return 0.0
 
-        is_syllabic = any(kw in (run_lang or "").lower() for kw in ["zh", "chinese", "cmn", "hans", "hant", "ja", "japanese", "ko", "korean"])
-        stretch_threshold = 0.35 if is_syllabic else 0.5
-
         n = len(word_alignments)
         durations = [max(0.0, w.end_time - w.start_time) for w in word_alignments]
 
-        # 1. squash_score：挤碎词占比（阈值门控，非渐进计分）
+        # 1. squash_score：挤碎词占比
         # 挤碎判据：duration < 0.02s（20ms 物理发不完一个字/词，是 FA 硬塞的标志）
-        # 门控逻辑：挤碎词占比 ≤ 60% 视为正常（英文 TTS 音频中 FA 天然产出大量 <20ms 词：
-        # function words a/the/in/of/to 正常 10-30ms，FA 对齐粒度细时易压到 20ms 以下，
-        # 实测正常英文 TTS 对齐 squash 占比 40-55%），通过即 1.0；
-        # 超过 60% 才判定为文本远超音频容量，直接归零。
+        # 不用相对阈值（median*0.1）：短词（a/the/in）正常就 0.03-0.08s，相对阈值会误判
         squashed = sum(1 for d in durations if d < 0.02)
-        squash_ratio = squashed / n
-        squash_score = 1.0 if squash_ratio <= 0.60 else 0.0
+        squash_score = 1.0 - squashed / n
 
-        # 2. stretch_score：拉伸词占比（阈值门控，非渐进计分）
-        # 拉伸判据：音节文字 > 350ms，字母文字 > 500ms
-        # 门控逻辑：拉伸词占比 ≤ 40% 视为正常（FA 对 TTS 音频的固有拉伸），通过即 1.0；
-        # 超过 40% 才判定为文本-音频严重不匹配，直接归零。
-        stretched = sum(1 for d in durations if d > stretch_threshold)
-        stretch_ratio = stretched / n
-        stretch_score = 1.0 if stretch_ratio <= 0.40 else 0.0
-
-        # 3. variance_score：词时长变异系数（CV = std/mean）
+        # 2. variance_score：词时长变异系数（CV = std/mean）
         # 只在 CV 极低（<0.2，线性插值痕迹）才惩罚；正常匀速朗读 CV 0.3-0.8 不扣
         mean_dur = sum(durations) / n
         if mean_dur > 1e-6:
@@ -1246,7 +1090,7 @@ class LongAudioAlignPipeline:
         else:
             variance_score = 0.0
 
-        hard = min(squash_score, stretch_score)
+        hard = squash_score   # coverage 砍掉，只用 squash 作主信号
         soft_penalty = 0.7 + 0.3 * variance_score
         final = hard * soft_penalty
 
@@ -1254,21 +1098,13 @@ class LongAudioAlignPipeline:
         if diag_out is not None and chunk_audio_duration and chunk_audio_duration > 0:
             last_end = word_alignments[-1].end_time
             diag_out.append(
-                f"  [FA健康度] 对齐词数={n} | 音频时长={chunk_audio_duration:.2f}s | "
-                f"末词结束={last_end:.2f}s | 挤碎词={squashed}个(占{squashed/n*100:.1f}%, <20ms被FA硬塞) | "
-                f"拉伸词={stretched}个(占{stretched/n*100:.1f}%, >{int(stretch_threshold*1000)}ms被FA硬拉) | "
-                f"挤碎分={squash_score:.3f} | 拉伸分={stretch_score:.3f} | 时长方差分={variance_score:.3f} | "
-                f"综合得分={final:.3f}"
+                f"  [FA-health] n={n} dur={chunk_audio_duration:.2f} "
+                f"last_end={last_end:.2f} squashed={squashed} "
+                f"squash={squash_score:.3f} "
+                f"var={variance_score:.3f} "
+                f"-> {final:.3f}"
             )
         return final
-
-    def _assert_fa_timestamps_in_chunk(self, word_alignments, chunk_start, chunk_end, req_id="Unknown"):
-        """Reject invalid FA timestamps before they can be converted to absolute time."""
-        try:
-            validate_fa_timestamps_in_chunk(word_alignments, chunk_start, chunk_end)
-        except FaTimestampError as err:
-            log_error(f"❌ {err}", req_id=req_id)
-            raise
 
     def _fa_search_bounds(self, is_head, chunk_audio, clean_reference_text, run_lang, chunk_dur, req_id="Unknown", diag_out=None, asr_char_count=None):
         """
@@ -1285,14 +1121,14 @@ class LongAudioAlignPipeline:
         Returns: (orig_start, orig_end, fa_res, score) | 失败返回 (None, None, None, 0.0)
         """
         text_len = len(clean_reference_text)
-        uses_character_tokens = self._uses_character_tokens(run_lang)
+        is_chinese = any(kw in (run_lang or "zh").lower() for kw in ["zh", "chinese", "cmn", "hans", "hant"])
 
         # 按音频时长估锚点（主，稳）
-        rate = 4.5 if uses_character_tokens else 12.5   # 字符/秒
+        rate = 4.5 if is_chinese else 12.5   # 字符/秒
         dur_anchor = int(chunk_dur * rate)
         # ASR 字数作辅助参考（若与时长估差异过大，取两者较小值，防 ASR 幻觉虚高）
         if asr_char_count and asr_char_count > 0:
-            asr_anchor = int(asr_char_count * (1.0 if uses_character_tokens else 5.0))
+            asr_anchor = int(asr_char_count * (1.0 if is_chinese else 5.0))
             anchor = min(dur_anchor, asr_anchor) if asr_anchor > dur_anchor * 1.5 else dur_anchor
         else:
             anchor = dur_anchor
@@ -1307,12 +1143,9 @@ class LongAudioAlignPipeline:
             int(anchor * 1.5),
         ]))
 
-        diag_out.append(f"    [候选边界] 共{len(candidate_lengths)}个候选（锚点={anchor}字）:")
-
         best = (None, None, None, -1.0)   # 初始 -1，让 score=0 也能被选中
-        best_idx = -1
 
-        for ci, length in enumerate(candidate_lengths):
+        for length in candidate_lengths:
             if length <= 0: continue
             if is_head:
                 # 锚点 start=0 固定，扫 end
@@ -1326,22 +1159,11 @@ class LongAudioAlignPipeline:
             try:
                 with self.fa_lock:
                     fa_res = self.fa_model.align(audio=[chunk_audio], text=[cand_text], language=run_lang)[0]
-                self._assert_fa_timestamps_in_chunk(
-                    fa_res, chunk_info['start'], chunk_info['end'], req_id,
-                )
-                score = self._evaluate_fa_health(fa_res, chunk_dur, diag_out=diag_out, run_lang=run_lang)
-                if diag_out:
-                    diag_out[-1] = f"    [候选{ci+1}/{len(candidate_lengths)}] 原文[{c_start}:{c_end}]={c_end-c_start}字 | " + diag_out[-1].lstrip()
+                score = self._evaluate_fa_health(fa_res, chunk_dur, diag_out=diag_out)
                 if score > best[3]:
                     best = (c_start, c_end, fa_res, score)
-                    best_idx = ci + 1
-            except FaTimestampError:
-                raise
             except Exception:
                 pass
-
-        if best[3] > 0 and diag_out:
-            diag_out.append(f"    [✅ 最优候选{best_idx}] 原文[{best[0]}:{best[1]}]={best[1]-best[0]}字 | score={best[3]:.3f}")
         return best
 
     def _align_head_tail_chunk(self, is_head, idx, chunk_info, asr_result,
@@ -1422,18 +1244,13 @@ class LongAudioAlignPipeline:
                 try:
                     with self.fa_lock:
                         fa_res = self.fa_model.align(audio=[chunk_audio], text=[ground_truth], language=run_lang)[0]
-                    self._assert_fa_timestamps_in_chunk(
-                        fa_res, chunk_info['start'], chunk_info['end'], req_id,
-                    )
-                    score = self._evaluate_fa_health(fa_res, chunk_dur, diag_out=diag_lines, run_lang=run_lang)
+                    score = self._evaluate_fa_health(fa_res, chunk_dur, diag_out=diag_lines)
                     if score > best_attempt_score:
                         best_attempt_score, best_attempt_gt, best_attempt_fa = score, ground_truth, fa_res
                     if score >= 0.95:
                         diag_lines.append(f"✅ attempt 1 通过 | score={score:.3f} >= 0.95 -> 采信 ASR 寻路边界")
                         return asr_orig_start, asr_orig_end, ground_truth, fa_res, new_ipa_cursor_from_asr, diag_lines
                     diag_lines.append(f"⚠️ attempt 1 失败 | score={score:.3f} < 0.95 -> 转 FA 搜边界")
-                except FaTimestampError:
-                    raise
                 except Exception as e:
                     diag_lines.append(f"⚠️ attempt 1 FA 异常 | {e} -> 转 FA 搜边界")
         else:
@@ -1510,18 +1327,19 @@ class LongAudioAlignPipeline:
         （开头无前驱时 start=end=0）。
         这样 word 文本拼接严格等于 ground_truth，与 originalText 同源。
         """
-        uses_character_tokens = self._uses_character_tokens(lang)
-        if uses_character_tokens:
-            # CJK languages without reliable whitespace tokenization: one
-            # Unicode letter/number per aligned token.
+        is_chinese = any(kw in (lang or "zh").lower() for kw in ["zh", "chinese", "cmn", "hans", "hant"])
+        if is_chinese:
+            valid_re = re.compile(r'[\u4e00-\u9fa5a-zA-Z0-9]')
+            # 中文：逐字符切分
             tokens = list(ground_truth)
             def is_valid_token(tok):
-                return bool(tok) and self._is_text_character(tok)
+                return bool(valid_re.match(tok))
         else:
-            # Whitespace-delimited languages, including Cyrillic and Hangul.
-            tokens = re.findall(r'\w+|[^\w]', ground_truth, re.UNICODE)
+            valid_re = re.compile(r'[a-z0-9]', re.IGNORECASE)
+            # 英文：按词切分，保留分隔符（标点/空白）作为独立 token
+            tokens = re.findall(r'[a-z0-9]+|[^a-z0-9]', ground_truth, re.IGNORECASE)
             def is_valid_token(tok):
-                return bool(tok) and self._is_text_character(tok[0])
+                return bool(tok) and bool(valid_re.match(tok[0]))
 
         rebuilt = []
         fa_idx = 0
@@ -1558,23 +1376,7 @@ class LongAudioAlignPipeline:
             "extra_in_result": extra_blocks         
         }
 
-    def _validate_subtitle_timestamps(self, words, req_id="Unknown"):
-        """校验字幕时间戳无时间倒流。
-
-        每个词条必须满足 start <= end，且 word 流的 start/end 都不能比
-        前一个词回退。后者不能只靠单词自身校验发现：例如前词
-        [180, 185]、后词 [170, 178] 都是合法区间，但字幕 cue 取首词
-        start 和末词 end 后会变成负时长。
-        """
-        try:
-            validate_absolute_timestamps(words)
-        except FaTimestampError as err:
-            log_error(f"❌ {err}", req_id=req_id)
-            raise
-        log_info(f"✅ 字幕时间戳校验通过 | {len(words)} 个词条时间单调且满足 start <= end", req_id=req_id)
-
     def process_audio(self, audio_path, reference_text, language_code=None, req_id="Unknown"):
-        """Align reference text using the ASR boundary route followed by FA."""
         pipeline_start_time = time.time()
         run_lang = language_code if language_code else self.config["language"]
         
@@ -1604,31 +1406,7 @@ class LongAudioAlignPipeline:
                 sample_rate = 16000
 
             total_audio_duration = len(wav) / sample_rate
-
-            # ── 全局音节速率预检（fail-fast，不浪费下游 VAD/ASR/FA 计算）──
-            # 物理依据：Pellegrino et al. (2011) 跨 7 语言（中/英/日/西/法/德/意）研究表明，
-            # 所有语言的音节速率落在 4.5-9.1 syll/s 区间——这是人类发声器官的生物力学常数，
-            # 与具体语言无关。取该区间最慢端（4.5）的一半 ≈ 2.0 syll/s 作极端保守下限：
-            # 任何正常语音（含慢读、停顿、思考）都不可能整体低于 2 syll/s。
-            # 低于此值说明音频时长与文本严重不匹配——音频含大量非语音内容（音乐/音效/长静音），
-            # 或文本残缺。此时强行对齐只会产出拉伸词（FA 把少量字硬拉过非语音段），结果不可信。
-            #
-            # 音节数估算：中文 1 字 = 1 音节（最精确）；其他语言用 "词数 × 1.5" 粗估
-            # （英语平均 1.5 音节/词，其他印欧语言类似）。阈值 2.0 极保守，估算误差不会误杀。
-            uses_character_tokens = self._uses_character_tokens(run_lang)
-            if uses_character_tokens:
-                est_syllables = len(clean_reference_text)
-            else:
-                est_syllables = len(clean_reference_text.split()) * 1.5
-            global_syll_rate = est_syllables / total_audio_duration if total_audio_duration > 0 else 0
-            if global_syll_rate < 2.0:
-                raise ValueError(
-                    f"音频时长与文本严重不匹配：估算音节速率 {global_syll_rate:.2f} syll/s "
-                    f"（文本≈{est_syllables:.0f}音节 / 音频{total_audio_duration:.1f}s），"
-                    f"远低于正常语音下限 2.0 syll/s。音频可能含大量非语音内容（音乐/音效/长静音）或文本残缺，"
-                    f"强制对齐结果不可信。"
-                )
-
+            
             try:
                 with self.vad_lock:
                     # min_silence_duration_ms=300：静音 ≥300ms 才切分（默认 100ms 会把句中短停顿也切碎，
@@ -1679,7 +1457,7 @@ class LongAudioAlignPipeline:
                 f"原文长度   : raw={raw_prompt_length}字 clean={len(clean_reference_text)}字 norm={len(norm_ref)}字",
                 f"VAD 细分片 : {len(raw_speech_timestamps)} 段（合并前）→ 合并后 {len(physical_chunks)} 段 chunk",
                 f"语言       : {run_lang}",
-                f"ASR 识别概况（每 chunk: 时长s / ASR字数 / ASR文本前30字 / 对应原文片段）:",
+                f"ASR 识别概况（每 chunk: 时长s / ASR字数 / ASR文本前30字）:",
             ]
             for i, (ci, res) in enumerate(zip(physical_chunks, asr_results)):
                 ci_dur = ci['end'] - ci['start']
@@ -1687,32 +1465,14 @@ class LongAudioAlignPipeline:
                 tag = ""
                 if i == 0: tag = " [首]"
                 elif i == len(physical_chunks) - 1: tag = " [尾]"
-                ob = orig_boundaries[i] if i < len(orig_boundaries) else (None, None)
-                ref_part = ""
-                ob_start, ob_end = ob
-                if ob_start is not None and ob_end is not None:
-                    ref_snippet = clean_reference_text[ob_start:ob_end][:30].replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-                    ref_part = f" | 原文[{ob_start}:{ob_end}]{ob_end-ob_start}字: {ref_snippet}..."
-                elif ob_start is not None:
-                    est_end = min(ob_start + 200, len(clean_reference_text))
-                    ref_snippet = clean_reference_text[ob_start:est_end][:30].replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-                    ref_part = f" | 原文[{ob_start}:?]≥{est_end-ob_start}字: {ref_snippet}..."
-                elif ob_end is not None:
-                    est_start = max(0, ob_end - 200)
-                    ref_snippet = clean_reference_text[est_start:ob_end][:30].replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-                    ref_part = f" | 原文[?:{ob_end}]≤{ob_end-est_start}字: {ref_snippet}..."
-                else:
-                    ref_part = " | 原文[未定位]"
                 req_diag.append(
                     f"  chunk{i}{tag} | {ci['start']:.1f}-{ci['end']:.1f}s ({ci_dur:.1f}s) | "
-                    f"asr={len(asr_txt)}字 | {asr_txt[:30]}...{ref_part}"
+                    f"asr={len(asr_txt)}字 | {asr_txt[:30]}..."
                 )
             log_block(req_diag, req_id=req_id, level="INFO")
 
             fa_batch_audios = []
             fa_batch_texts = []
-            # Keep the integer chunk index with each FA request. Recovering it
-            # later from a floating-point start timestamp is unsafe.
             chunk_mapping_meta = []
             # 首尾特例路径产出的 FA 结果：idx -> (chunk_info, ground_truth, fa_res)
             # 末尾批量 FA 时跳过这些 idx，直接复用
@@ -1724,90 +1484,65 @@ class LongAudioAlignPipeline:
             prev_orig_end = 0
             total_chunks = len(physical_chunks)
 
-            for chunk_idx in range(1, total_chunks):
-                previous_chunk = physical_chunks[chunk_idx - 1]
-                current_chunk = physical_chunks[chunk_idx]
-                if current_chunk['start'] < previous_chunk['start']:
-                    raise ValueError(
-                        f"chunk 起点回退: chunk[{chunk_idx - 1}].start={previous_chunk['start']}, "
-                        f"chunk[{chunk_idx}].start={current_chunk['start']}"
-                    )
-
             epi = self._get_epitran(run_lang)
 
             try:
-                # 首尾优先：先处理首尾 chunk，失败则立即中止（中间 chunk 无需浪费计算）
-                processing_order = [0] + ([total_chunks - 1] if total_chunks > 1 else []) + list(range(1, total_chunks - 1))
-                head_cursor_state = None
-
-                for idx in processing_order:
-                    chunk_info = physical_chunks[idx]
-                    res = asr_results[idx]
+                for idx, (chunk_info, res) in enumerate(zip(physical_chunks, asr_results)):
                     is_head = (idx == 0)
                     is_tail = (idx == total_chunks - 1)
                     hard_start, hard_end = orig_boundaries[idx] if idx < len(orig_boundaries) else (None, None)
 
-                    if idx == 1 and head_cursor_state is not None:
-                        current_ipa_cursor, prev_orig_end = head_cursor_state
-
-                    # ── 硬匹配命中：FA 验证健康度，通过则采信，不通过则 fallback 寻路 ──
+                    # ── 硬匹配命中：直接用硬锚点，跳过寻路 ──
                     if hard_start is not None and hard_end is not None:
                         ground_truth = clean_reference_text[hard_start:hard_end]
                         if ground_truth.strip():
                             chunk_dur = chunk_info['end'] - chunk_info['start']
                             with self.fa_lock:
                                 fa_res = self.fa_model.align(audio=[batch_audios[idx]], text=[ground_truth], language=run_lang)[0]
-                            self._assert_fa_timestamps_in_chunk(
-                                fa_res, chunk_info['start'], chunk_info['end'], req_id,
-                            )
-                            fa_score = self._evaluate_fa_health(fa_res, chunk_dur, diag_out=None, run_lang=run_lang)
+                            # 验 FA 健康度（留痕：硬匹配只定边界，FA 仍跑健康度记录对齐质量）
+                            fa_score = self._evaluate_fa_health(fa_res, chunk_dur, diag_out=None)
+                            # 诊断行（首尾收集到 head_tail_diag，中间走 batch 但仍记录硬匹配 + FA 健康度）
                             label = "首" if is_head else ("尾" if is_tail else f"中间[{idx}]")
-
-                            if fa_score >= self.ASR_FA_HEALTH_THRESHOLD:
-                                hard_diag = [
-                                    f"━━━ {label}chunk[{idx}] 处理 | 音频{chunk_dur:.2f}s ━━━ | "
-                                    f"✅ 硬匹配锚点 | 原文[{hard_start}:{hard_end}] | 原文{hard_end-hard_start}字 | 跳过寻路直接 FA | "
-                                    f"[FA-health] score={fa_score:.3f} >= {self.ASR_FA_HEALTH_THRESHOLD} (硬匹配采信)",
-                                ]
-                                if is_head or is_tail:
-                                    head_tail_fa_results[idx] = (chunk_info, ground_truth, fa_res)
-                                    head_tail_diag[idx] = hard_diag
-                                else:
-                                    fa_batch_audios.append(batch_audios[idx])
-                                    fa_batch_texts.append(ground_truth)
-                                    chunk_mapping_meta.append((idx, chunk_info))
-                                    log_block(hard_diag, req_id=req_id, level="INFO")
-                                if is_head:
-                                    new_cursor = 0
-                                    for n_idx in range(len(ipa_ref) - 1, -1, -1):
-                                        norm_pos = ipa_to_norm_map[n_idx]
-                                        if norm_pos < len(ref_idx_map) and ref_idx_map[norm_pos] <= hard_end:
-                                            new_cursor = n_idx
-                                            break
-                                    current_ipa_cursor = new_cursor
-                                    prev_orig_end = hard_end
-                                    head_cursor_state = (current_ipa_cursor, prev_orig_end)
-                                elif is_tail:
-                                    prev_orig_end = hard_end
-                                else:
-                                    new_cursor = current_ipa_cursor
-                                    for n_idx in range(current_ipa_cursor, len(ipa_ref)):
-                                        norm_pos = ipa_to_norm_map[n_idx]
-                                        if norm_pos < len(ref_idx_map) and ref_idx_map[norm_pos] >= hard_end:
-                                            new_cursor = n_idx
-                                            break
-                                    else:
-                                        new_cursor = len(ipa_ref)
-                                    current_ipa_cursor = new_cursor
-                                    prev_orig_end = hard_end
-                                continue
+                            hard_diag = [
+                                f"━━━ {label}chunk[{idx}] 处理 | 音频{chunk_dur:.2f}s ━━━",
+                                f"✅ 硬匹配锚点 | 原文[{hard_start}:{hard_end}] | 原文{hard_end-hard_start}字 | 跳过寻路直接 FA",
+                                f"  [FA-health] score={fa_score:.3f} (硬匹配采信，FA 健康度仅记录留痕)",
+                            ]
+                            if is_head or is_tail:
+                                head_tail_fa_results[idx] = (chunk_info, ground_truth, fa_res)
+                                head_tail_diag[idx] = hard_diag
                             else:
-                                log_warn(
-                                    f"⚠️ {label}chunk[{idx}] 硬匹配 FA 健康度不达标 | "
-                                    f"score={fa_score:.3f} < {self.ASR_FA_HEALTH_THRESHOLD} | "
-                                    f"原文[{hard_start}:{hard_end}] | 放弃硬匹配，fallback 寻路",
-                                    req_id=req_id,
-                                )
+                                fa_batch_audios.append(batch_audios[idx])
+                                fa_batch_texts.append(ground_truth)
+                                chunk_mapping_meta.append(chunk_info)
+                                # 中间 chunk 硬匹配诊断：直接 INFO 打印（不走首尾聚合）
+                                log_block(hard_diag, req_id=req_id, level="INFO")
+                            # 推进游标
+                            if is_head:
+                                # 用 hard_end 反推 ipa cursor
+                                new_cursor = 0
+                                for n_idx in range(len(ipa_ref) - 1, -1, -1):
+                                    norm_pos = ipa_to_norm_map[n_idx]
+                                    if norm_pos < len(ref_idx_map) and ref_idx_map[norm_pos] <= hard_end:
+                                        new_cursor = n_idx
+                                        break
+                                current_ipa_cursor = new_cursor
+                                prev_orig_end = hard_end
+                            elif is_tail:
+                                prev_orig_end = hard_end
+                            else:
+                                # 中间 chunk：用 hard_end 反推 ipa cursor
+                                new_cursor = current_ipa_cursor
+                                for n_idx in range(current_ipa_cursor, len(ipa_ref)):
+                                    norm_pos = ipa_to_norm_map[n_idx]
+                                    if norm_pos < len(ref_idx_map) and ref_idx_map[norm_pos] >= hard_end:
+                                        new_cursor = n_idx
+                                        break
+                                else:
+                                    new_cursor = len(ipa_ref)
+                                current_ipa_cursor = new_cursor
+                                prev_orig_end = hard_end
+                            continue
 
                     # ── 硬匹配未命中：走原寻路逻辑 ──
                     if is_head or is_tail:
@@ -1823,7 +1558,6 @@ class LongAudioAlignPipeline:
                         if is_head:
                             current_ipa_cursor = new_cursor
                             prev_orig_end = orig_end
-                            head_cursor_state = (current_ipa_cursor, prev_orig_end)
                         else:
                             prev_orig_end = orig_end
                         continue
@@ -1859,15 +1593,10 @@ class LongAudioAlignPipeline:
                             try:
                                 with self.fa_lock:
                                     fa_res = self.fa_model.align(audio=[current_chunk_audio], text=[candidate_text], language=run_lang)[0]
-                                self._assert_fa_timestamps_in_chunk(
-                                    fa_res, chunk_info['start'], chunk_info['end'], req_id,
-                                )
-                                score = self._evaluate_fa_health(fa_res, run_lang=run_lang)
+                                score = self._evaluate_fa_health(fa_res)
                                 if score > best_fa_score:
                                     best_fa_score = score
                                     best_candidate_cursor = orig_start + len(candidate_text)
-                            except FaTimestampError:
-                                raise
                             except Exception:
                                 pass
 
@@ -1907,7 +1636,7 @@ class LongAudioAlignPipeline:
 
                     fa_batch_audios.append(batch_audios[idx])
                     fa_batch_texts.append(ground_truth)
-                    chunk_mapping_meta.append((idx, chunk_info))
+                    chunk_mapping_meta.append(chunk_info)
 
             except AlignmentThresholdError as threshold_err:
                 # 首尾对齐失败：把诊断行攒进 head_tail_diag，末尾统一打印
@@ -1930,14 +1659,11 @@ class LongAudioAlignPipeline:
             verbose_json = {"task": "transcribe", "language": run_lang, "duration": round(total_audio_duration, 2), "report": {}, "text": "", "words": []}
 
             # 合并首尾特例的 FA 结果 + 中间 chunk 的批量 FA 结果，按 idx 顺序输出（时间序）
-            uses_character_tokens = self._uses_character_tokens(run_lang)
+            is_chinese_lang = any(kw in run_lang.lower() for kw in ["zh", "chinese", "cmn", "hans", "hant"])
             fa_text_parts = []
 
             def _emit_fa(chunk_info, ground_truth, single_fa_res):
                 chunk_start = chunk_info['start']
-                self._assert_fa_timestamps_in_chunk(
-                    single_fa_res, chunk_start, chunk_info['end'], req_id,
-                )
                 rebuilt_words = self._rebuild_words_from_ground_truth(ground_truth, single_fa_res, run_lang)
                 for w in rebuilt_words:
                     verbose_json["words"].append({
@@ -1953,8 +1679,9 @@ class LongAudioAlignPipeline:
             for idx, payload in head_tail_fa_results.items():
                 final_chunks[idx] = payload
 
-            # 2. 中间 chunk 跑批量 FA（首尾 idx 不在 batch 里）。
-            # qwen_asr 按输入顺序返回结果，直接使用提交时绑定的 idx 回填。
+            # 2. 中间 chunk 跑批量 FA（首尾 idx 不在 batch 里），结果按入队顺序回填 idx
+            # chunk_mapping_meta 与 fa_batch 同序，用 chunk_info['start'] 反查 idx
+            start_to_idx = {ch['start']: i for i, ch in enumerate(physical_chunks)}
             if fa_batch_audios:
                 try:
                     with self.fa_lock:
@@ -1963,65 +1690,16 @@ class LongAudioAlignPipeline:
                     log_error(f"阶段: FA ForcedAligner 批量推理对齐失败 | 详情: {err}", req_id=req_id)
                     raise
 
-                if len(fa_results) != len(chunk_mapping_meta):
-                    raise ValueError(
-                        f"FA batch 结果数量不匹配: requested={len(chunk_mapping_meta)}, "
-                        f"returned={len(fa_results)}"
-                    )
-
-                for (idx, chunk_info), ground_truth, single_fa_res in zip(chunk_mapping_meta, fa_batch_texts, fa_results):
-                    self._assert_fa_timestamps_in_chunk(
-                        single_fa_res, chunk_info['start'], chunk_info['end'], req_id,
-                    )
+                for chunk_info, ground_truth, single_fa_res in zip(chunk_mapping_meta, fa_batch_texts, fa_results):
+                    idx = start_to_idx[chunk_info['start']]
                     final_chunks[idx] = (chunk_info, ground_truth, single_fa_res)
 
-            # 3. 按 idx 时间序统一输出 + 收集全部 word_alignments 算全文 FA 健康度
-            all_word_alignments = []
-            fa_emit_diag = []
-            missing_chunks = [idx for idx in range(total_chunks) if idx not in final_chunks]
-            if missing_chunks:
-                raise ValueError(f"FA 结果缺少 chunk: {missing_chunks}")
+            # 3. 按 idx 时间序统一输出
             for idx in sorted(final_chunks.keys()):
                 chunk_info, ground_truth, single_fa_res = final_chunks[idx]
                 _emit_fa(chunk_info, ground_truth, single_fa_res)
-                all_word_alignments.extend(single_fa_res)
-                if single_fa_res:
-                    chunk_duration = chunk_info['end'] - chunk_info['start']
-                    relative_start = single_fa_res[0].start_time
-                    relative_end = single_fa_res[-1].end_time
-                    start_overflow = max(0.0, -relative_start)
-                    end_overflow = max(0.0, relative_end - chunk_duration)
-                    mapping_status = "正常"
-                    if start_overflow > 0.05 or end_overflow > 0.05:
-                        mapping_status = (
-                            f"⚠️ FA相对时间越界"
-                            f"(start超界{start_overflow:.3f}s,end超界{end_overflow:.3f}s)"
-                        )
-                        log_error(
-                            f"❌ FA chunk 时间映射越界 | chunk[{idx}] "
-                            f"音频窗口={chunk_duration:.3f}s | "
-                            f"FA相对={relative_start:.3f}..{relative_end:.3f}s | "
-                            f"FA绝对={chunk_info['start'] + relative_start:.3f}.."
-                            f"{chunk_info['start'] + relative_end:.3f}s | "
-                            f"这会与相邻 chunk 重叠并导致后续词时间戳非单调",
-                            req_id=req_id,
-                        )
-                    fa_emit_diag.append(
-                        f"chunk[{idx}] start={chunk_info['start']:.3f}s end={chunk_info['end']:.3f}s "
-                        f"窗口={chunk_duration:.3f}s "
-                        f"FA相对={relative_start:.3f}..{relative_end:.3f}s "
-                        f"FA绝对={chunk_info['start'] + single_fa_res[0].start_time:.3f}.."
-                        f"{chunk_info['start'] + relative_end:.3f}s "
-                        f"{mapping_status} "
-                        f"words={len(single_fa_res)}"
-                    )
 
-            if fa_emit_diag:
-                log_block(["━━━━━ FA chunk 时间映射诊断 ━━━━━"] + fa_emit_diag, req_id=req_id)
-
-            verbose_json["text"] = "".join(fa_text_parts) if uses_character_tokens else " ".join(fa_text_parts)
-
-            self._validate_subtitle_timestamps(verbose_json["words"], req_id=req_id)
+            verbose_json["text"] = "".join(fa_text_parts) if is_chinese_lang else " ".join(fa_text_parts)
 
             verbose_json["report"] = self._generate_diff_report(clean_reference_text, verbose_json["text"], run_lang)
             total_pipeline_time = time.time() - pipeline_start_time
@@ -2031,9 +1709,6 @@ class LongAudioAlignPipeline:
             align_status = "✅ 成功" if accuracy_val > 50 else "⚠️ 相似度低"
             ref_len = verbose_json["report"].get("ref_length", 0)
             res_len = verbose_json["report"].get("result_length", 0)
-
-            global_fa_diag = []
-            global_fa_score = self._evaluate_fa_health(all_word_alignments, total_audio_duration, diag_out=global_fa_diag, run_lang=run_lang)
 
             task_info = get_task_info(req_id)
             file_name = task_info.get("file", "(未知)") if task_info else "(未知)"
@@ -2048,256 +1723,34 @@ class LongAudioAlignPipeline:
                 # ── 首尾特例结果汇总 ──
                 if head_tail_fa_results:
                     all_diag.append("━━━ 首尾对齐结果汇总 ━━━")
-                    is_syllabic_lang = any(kw in (run_lang or "").lower() for kw in ["zh", "chinese", "cmn", "hans", "hant", "ja", "japanese", "ko", "korean"])
                     for idx in sorted(head_tail_fa_results.keys()):
                         chunk_info, ground_truth, fa_res = head_tail_fa_results[idx]
                         tag = "首" if idx == 0 else "尾"
                         ci_dur = chunk_info['end'] - chunk_info['start']
                         n_words = len(fa_res) if fa_res else 0
-                        if is_syllabic_lang:
-                            text_desc = f"原文{len(ground_truth)}字"
-                        else:
-                            text_desc = f"原文{len(ground_truth.split())}词({len(ground_truth)}字符)"
                         all_diag.append(
                             f"  {tag}chunk[{idx}] | 音频{ci_dur:.1f}s | "
-                            f"{text_desc} | FA对齐{n_words}词"
+                            f"原文{len(ground_truth)}字 | FA对齐{n_words}词"
                         )
                 log_block(all_diag, req_id=req_id, level="INFO")
 
             log_block([
                 f"📊 最终报告 (对齐模式)",
                 f"文件名       : {file_name}",
-                f"执行状态     : {align_status} (相似度: {accuracy_str} | FA-health: {global_fa_score:.3f})",
+                f"执行状态     : {align_status} (相似度: {accuracy_str})",
                 f"物理切片     : {len(physical_chunks)} 段 -> 有效对齐 {len(fa_batch_audios) + len(head_tail_fa_results)} 段",
                 f"字符匹配     : 原文={raw_prompt_length}字 | 归一化={ref_len}字 | 对齐={res_len}字",
                 f"音频时长     : {total_audio_duration:.2f}s",
                 f"流水线耗时   : {total_pipeline_time:.2f}s",
                 f"RTF          : {total_pipeline_time / total_audio_duration:.3f}",
-            ] + global_fa_diag, req_id=req_id)
+            ], req_id=req_id)
             
             return verbose_json
 
         except Exception as outer_err:
             raise outer_err
 
-    def process_audio_fa_only(self, audio_path, reference_text, language_code=None, req_id="Unknown"):
-        """Align reference text with FA only; this path never invokes the ASR scheduler."""
-        pipeline_start_time = time.time()
-        run_lang = language_code if language_code else self.config["language"]
-        clean_reference_text = re.sub(r'[ \t\r\f\v]+', ' ', reference_text).strip()
-        if not clean_reference_text:
-            raise ValueError("纯 ForcedAligner 模式要求 prompt 不能为空。")
-
-        try:
-            audio_data, sample_rate = sf.read(audio_path)
-        except Exception as err:
-            log_error(f"阶段: 音频读取失败 | 详情: {err}", req_id=req_id)
-            raise
-
-        wav = torch.from_numpy(audio_data).float()
-        if wav.dim() > 1:
-            wav = wav.mean(dim=1)
-        if sample_rate != 16000:
-            import torchaudio.functional as F
-            wav = F.resample(wav, sample_rate, 16000)
-            sample_rate = 16000
-
-        total_audio_duration = len(wav) / sample_rate
-        if total_audio_duration <= 0:
-            raise ValueError("音频为空，无法进行 ForcedAligner 对齐。")
-
-        try:
-            with self.vad_lock:
-                raw_speech_timestamps = self.get_speech_timestamps(
-                    wav,
-                    self.vad_model,
-                    return_seconds=True,
-                    min_silence_duration_ms=300,
-                )
-            if not raw_speech_timestamps:
-                raise ValueError("VAD 未检测到任何有效人声。")
-        except Exception as err:
-            log_error(f"阶段: VAD 物理切片失败 | 详情: {err}", req_id=req_id)
-            raise
-
-        physical_chunks = self._group_vad_timestamps(
-            raw_speech_timestamps,
-            total_audio_duration,
-            max_sec=self.config.get("chunk_max_sec", 60),
-        )
-        if not physical_chunks:
-            raise ValueError("VAD 未生成可用的 ForcedAligner 音频分块。")
-
-        uses_character_tokens = self._uses_character_tokens(run_lang)
-        if uses_character_tokens:
-            token_end_indices = [
-                index + 1
-                for index, char in enumerate(clean_reference_text)
-                if self._is_text_character(char)
-            ]
-        else:
-            token_end_indices = [match.end() for match in re.finditer(r'\w+', clean_reference_text, re.UNICODE)]
-
-        if not token_end_indices:
-            raise ValueError("prompt 不包含可供 ForcedAligner 对齐的文本。")
-        if len(physical_chunks) > len(token_end_indices):
-            raise ValueError(
-                f"VAD 分块数 ({len(physical_chunks)}) 超过可对齐文本单元数 ({len(token_end_indices)})，"
-                "无法在不使用 ASR 的情况下安全推断文本边界。"
-            )
-
-        def speech_duration(chunk):
-            return sum(
-                max(0.0, min(chunk["end"], ts["end"]) - max(chunk["start"], ts["start"]))
-                for ts in raw_speech_timestamps
-            )
-
-        chunk_speech_durations = [speech_duration(chunk) for chunk in physical_chunks]
-        total_speech_duration = sum(chunk_speech_durations)
-        if total_speech_duration <= 0:
-            raise ValueError("VAD 语音时长为零，无法推断 ForcedAligner 文本边界。")
-
-        aligned_chunks = []
-        cursor_token = 0
-        cumulative_speech_duration = 0.0
-        total_tokens = len(token_end_indices)
-
-        for chunk_idx, chunk_info in enumerate(physical_chunks):
-            cumulative_speech_duration += chunk_speech_durations[chunk_idx]
-            remaining_chunks = len(physical_chunks) - chunk_idx - 1
-            min_token_end = cursor_token + 1
-            max_token_end = total_tokens - remaining_chunks
-
-            if remaining_chunks == 0:
-                candidate_token_counts = [total_tokens]
-            else:
-                target_token_count = round(
-                    total_tokens * cumulative_speech_duration / total_speech_duration
-                )
-                search_radius = max(3, int(total_tokens * 0.12))
-                candidate_token_counts = sorted({
-                    max(min_token_end, min(max_token_end, target_token_count + offset))
-                    for offset in (-search_radius, -search_radius // 2, 0, search_radius // 2, search_radius)
-                })
-
-            start_sample = max(0, int(chunk_info["start"] * sample_rate))
-            end_sample = min(len(wav), int(chunk_info["end"] * sample_rate))
-            chunk_audio = (wav[start_sample:end_sample].numpy(), sample_rate)
-            chunk_duration = chunk_info["end"] - chunk_info["start"]
-            best = None
-            diagnostics = []
-
-            for candidate_token_count in candidate_token_counts:
-                text_start = 0 if cursor_token == 0 else token_end_indices[cursor_token - 1]
-                text_end = token_end_indices[candidate_token_count - 1]
-                ground_truth = clean_reference_text[text_start:text_end]
-                if not ground_truth.strip():
-                    continue
-                try:
-                    with self.fa_lock:
-                        fa_res = self.fa_model.align(
-                            audio=[chunk_audio],
-                            text=[ground_truth],
-                            language=run_lang,
-                        )[0]
-                    self._assert_fa_timestamps_in_chunk(
-                        fa_res,
-                        chunk_info["start"],
-                        chunk_info["end"],
-                        req_id,
-                    )
-                    score = self._evaluate_fa_health(
-                        fa_res,
-                        chunk_duration,
-                        run_lang=run_lang,
-                    )
-                    diagnostics.append(
-                        f"候选文本单元={candidate_token_count} | FA-health={score:.3f}"
-                    )
-                    if best is None or score > best[0]:
-                        best = (score, candidate_token_count, ground_truth, fa_res)
-                except FaTimestampError:
-                    raise
-                except Exception as err:
-                    diagnostics.append(
-                        f"候选文本单元={candidate_token_count} | FA异常={err}"
-                    )
-
-            if best is None or best[0] < self.FINAL_FA_HEALTH_THRESHOLD:
-                details = "；".join(diagnostics) if diagnostics else "无有效候选"
-                raise AlignmentThresholdError(
-                    f"[纯 FA 对齐失败] chunk[{chunk_idx}] | 音频 {chunk_duration:.1f}s | {details}",
-                    diagnostics,
-                )
-
-            score, selected_token_count, ground_truth, fa_res = best
-            aligned_chunks.append((chunk_info, ground_truth, fa_res))
-            cursor_token = selected_token_count
-            log_info(
-                f"纯 FA 边界 | chunk[{chunk_idx}] | 文本单元={selected_token_count}/{total_tokens} | "
-                f"FA-health={score:.3f}",
-                req_id=req_id,
-            )
-
-        verbose_json = {
-            "task": "transcribe",
-            "language": run_lang,
-            "duration": round(total_audio_duration, 2),
-            "report": {},
-            "text": clean_reference_text,
-            "words": [],
-        }
-        all_word_alignments = []
-        for chunk_info, ground_truth, fa_res in aligned_chunks:
-            self._assert_fa_timestamps_in_chunk(
-                fa_res,
-                chunk_info["start"],
-                chunk_info["end"],
-                req_id,
-            )
-            rebuilt_words = self._rebuild_words_from_ground_truth(
-                ground_truth,
-                fa_res,
-                run_lang,
-            )
-            for word in rebuilt_words:
-                verbose_json["words"].append({
-                    "word": word["text"],
-                    "start": round(chunk_info["start"] + word["start"], 3),
-                    "end": round(chunk_info["start"] + word["end"], 3),
-                })
-            all_word_alignments.extend(fa_res)
-
-        self._validate_subtitle_timestamps(verbose_json["words"], req_id=req_id)
-        verbose_json["report"] = self._generate_diff_report(
-            clean_reference_text,
-            verbose_json["text"],
-            run_lang,
-        )
-
-        total_pipeline_time = time.time() - pipeline_start_time
-        global_fa_diag = []
-        global_fa_score = self._evaluate_fa_health(
-            all_word_alignments,
-            total_audio_duration,
-            diag_out=global_fa_diag,
-            run_lang=run_lang,
-        )
-        task_info = get_task_info(req_id)
-        file_name = task_info.get("file", "(未知)") if task_info else "(未知)"
-        log_block([
-            "📊 最终报告 (纯 ForcedAligner 模式)",
-            f"文件名       : {file_name}",
-            f"执行状态     : ✅ 成功 (FA-health: {global_fa_score:.3f})",
-            f"物理切片     : {len(physical_chunks)} 段 -> 有效对齐 {len(aligned_chunks)} 段",
-            f"字符匹配     : 原文={len(clean_reference_text)}字 | 对齐={len(verbose_json['words'])}词条",
-            f"音频时长     : {total_audio_duration:.2f}s",
-            f"流水线耗时   : {total_pipeline_time:.2f}s",
-            f"RTF          : {total_pipeline_time / total_audio_duration:.3f}",
-        ] + global_fa_diag, req_id=req_id)
-        return verbose_json
-
-    def process_audio_asr_only(self, audio_path, language_code=None, req_id="Unknown", sampling_params=None):
+    def process_audio_asr_only(self, audio_path, language_code=None, req_id="Unknown"):
         pipeline_start_time = time.time()
         run_lang = language_code if language_code else self.config["language"]
 
@@ -2343,12 +1796,7 @@ class LongAudioAlignPipeline:
             asr_stage_start = time.time()
 
             try:
-                asr_results = self.asr_scheduler.submit(
-                    audios=batch_audios,
-                    language=run_lang,
-                    req_id=req_id,
-                    sampling_params=sampling_params,
-                )
+                asr_results = self.asr_scheduler.submit(audios=batch_audios, language=run_lang, req_id=req_id)
             except Exception as err:
                 log_error(f"阶段: 纯ASR模型批量推理崩溃 | 详情: {err}", req_id=req_id)
                 raise
