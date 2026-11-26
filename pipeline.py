@@ -14,6 +14,7 @@ from utils import get_container_cpu_count
 from silero_vad import load_silero_vad, get_speech_timestamps
 from fa_timestamp_validation import (
     FaTimestampError,
+    assert_within_fa_audio_limit,
     normalize_fa_interval_overlaps,
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
@@ -31,7 +32,7 @@ if 'main' not in _sys.modules and '__main__' in _sys.modules:
 from main import (
     log, log_info, log_warn, log_error, log_block,
     register, mark_running, mark_done, mark_failed, unregister, reset_for_retry,
-    get_task_info,
+    note_audio_file,
 )
 
 try:
@@ -268,17 +269,20 @@ class LongAudioAlignPipeline:
             except ImportError:
                 model_kwargs["attn_implementation"] = "sdpa"
                 print(f"  GPU 模式 | dtype={self.dtype} | SDPA")
-
-            total_cores = get_container_cpu_count()
-            cpu_ratio = config.get("cpu_ratio", 0.5)
-            allocated_cores = max(1, int(total_cores * cpu_ratio))
-            torch.set_num_threads(allocated_cores)
         else:
             self.dtype = torch.float32
-            print("  CPU 模式 | 单线程")
-            os.environ["OMP_NUM_THREADS"] = "1"
-            os.environ["MKL_NUM_THREADS"] = "1"
-            torch.set_num_threads(1) 
+            # CPU 分支与 GPU 分支同口径：按 cpu_ratio 分配 intra-op 线程数。
+            # 原先这里写死单线程，理由是把 GPU 侧「generate() 非线程安全，故调度器
+            # 单线程 worker」的结论照搬了过来——那是调度器的约束，不是算子的约束。
+            # FA 一次前向的 5000 类输出头与 28 层 FFN 是纯算力负载，单线程直接浪费核数。
+            print(f"  CPU 模式 | dtype=float32")
+
+        # 算子线程数只在这里算一次，两个分支共用，避免口径分叉。
+        total_cores = get_container_cpu_count()
+        cpu_ratio = config["cpu_ratio"]
+        allocated_cores = max(1, int(total_cores * cpu_ratio))
+        torch.set_num_threads(allocated_cores)
+        print(f"  算子线程 | {allocated_cores}/{total_cores} (cpu_ratio={cpu_ratio})")
 
         model_kwargs["torch_dtype"] = self.dtype
         asr_path = server_env().asr_model_path
@@ -1678,10 +1682,8 @@ class LongAudioAlignPipeline:
                     raise
 
             # ── 请求级聚合日志：音频概况 + ASR 识别概况 ──
-            task_info = get_task_info(req_id)
-            audio_name = task_info.get("file", "") if task_info else ""
-            if not audio_name:
-                audio_name = os.path.basename(audio_path) if audio_path else "(未知)"
+            audio_name = os.path.basename(audio_path) if audio_path else "(未知)"
+            note_audio_file(req_id, audio_name)
             req_diag = [
                 f"━━━━━ 请求处理开始 | {audio_name} ━━━━━",
                 f"音频总时长 : {total_audio_duration:.2f}s",
@@ -2056,8 +2058,7 @@ class LongAudioAlignPipeline:
             global_fa_diag = []
             global_fa_score = self._evaluate_fa_health(all_word_alignments, total_audio_duration, diag_out=global_fa_diag, run_lang=run_lang)
 
-            task_info = get_task_info(req_id)
-            file_name = task_info.get("file", "(未知)") if task_info else "(未知)"
+            file_name = os.path.basename(audio_path) if audio_path else "(未知)"
 
             # ── 首尾 chunk 诊断汇总（成功路径：所有 diag_lines 统一打印）──
             if head_tail_diag:
@@ -2102,7 +2103,12 @@ class LongAudioAlignPipeline:
             raise outer_err
 
     def process_audio_fa_only(self, audio_path, reference_text, language_code=None, req_id="Unknown"):
-        """Align reference text with FA only; this path never invokes the ASR scheduler."""
+        """纯透传：整段音频与整章文本各一份，原样交给 FA。
+
+        本路径不跑 VAD、不推文本边界、不做候选搜索。信的边界是调用方给的，
+        即「这段音频就是这段文本的朗读」。音频超过 FA_MAX_AUDIO_SEC 时直接拒绝，
+        不做切块降级。
+        """
         pipeline_start_time = time.time()
         run_lang = language_code if language_code else self.config["language"]
         clean_reference_text = re.sub(r'[ \t\r\f\v]+', ' ', reference_text).strip()
@@ -2126,139 +2132,20 @@ class LongAudioAlignPipeline:
         total_audio_duration = len(wav) / sample_rate
         if total_audio_duration <= 0:
             raise ValueError("音频为空，无法进行 ForcedAligner 对齐。")
+        assert_within_fa_audio_limit(total_audio_duration)
 
-        try:
-            with self.vad_lock:
-                raw_speech_timestamps = self.get_speech_timestamps(
-                    wav,
-                    self.vad_model,
-                    return_seconds=True,
-                    min_silence_duration_ms=300,
-                )
-            if not raw_speech_timestamps:
-                raise ValueError("VAD 未检测到任何有效人声。")
-        except Exception as err:
-            log_error(f"阶段: VAD 物理切片失败 | 详情: {err}", req_id=req_id)
-            raise
-
-        physical_chunks = self._group_vad_timestamps(
-            raw_speech_timestamps,
+        with self.fa_lock:
+            fa_res = self.fa_model.align(
+                audio=[(wav.numpy(), sample_rate)],
+                text=[clean_reference_text],
+                language=run_lang,
+            )[0]
+        self._assert_fa_timestamps_in_chunk(
+            fa_res,
+            0.0,
             total_audio_duration,
-            max_sec=self.config.get("chunk_max_sec", 60),
+            req_id,
         )
-        if not physical_chunks:
-            raise ValueError("VAD 未生成可用的 ForcedAligner 音频分块。")
-
-        uses_character_tokens = self._uses_character_tokens(run_lang)
-        if uses_character_tokens:
-            token_end_indices = [
-                index + 1
-                for index, char in enumerate(clean_reference_text)
-                if self._is_text_character(char)
-            ]
-        else:
-            token_end_indices = [match.end() for match in re.finditer(r'\w+', clean_reference_text, re.UNICODE)]
-
-        if not token_end_indices:
-            raise ValueError("prompt 不包含可供 ForcedAligner 对齐的文本。")
-        if len(physical_chunks) > len(token_end_indices):
-            raise ValueError(
-                f"VAD 分块数 ({len(physical_chunks)}) 超过可对齐文本单元数 ({len(token_end_indices)})，"
-                "无法在不使用 ASR 的情况下安全推断文本边界。"
-            )
-
-        def speech_duration(chunk):
-            return sum(
-                max(0.0, min(chunk["end"], ts["end"]) - max(chunk["start"], ts["start"]))
-                for ts in raw_speech_timestamps
-            )
-
-        chunk_speech_durations = [speech_duration(chunk) for chunk in physical_chunks]
-        total_speech_duration = sum(chunk_speech_durations)
-        if total_speech_duration <= 0:
-            raise ValueError("VAD 语音时长为零，无法推断 ForcedAligner 文本边界。")
-
-        aligned_chunks = []
-        cursor_token = 0
-        cumulative_speech_duration = 0.0
-        total_tokens = len(token_end_indices)
-
-        for chunk_idx, chunk_info in enumerate(physical_chunks):
-            cumulative_speech_duration += chunk_speech_durations[chunk_idx]
-            remaining_chunks = len(physical_chunks) - chunk_idx - 1
-            min_token_end = cursor_token + 1
-            max_token_end = total_tokens - remaining_chunks
-
-            if remaining_chunks == 0:
-                candidate_token_counts = [total_tokens]
-            else:
-                target_token_count = round(
-                    total_tokens * cumulative_speech_duration / total_speech_duration
-                )
-                search_radius = max(3, int(total_tokens * 0.12))
-                candidate_token_counts = sorted({
-                    max(min_token_end, min(max_token_end, target_token_count + offset))
-                    for offset in (-search_radius, -search_radius // 2, 0, search_radius // 2, search_radius)
-                })
-
-            start_sample = max(0, int(chunk_info["start"] * sample_rate))
-            end_sample = min(len(wav), int(chunk_info["end"] * sample_rate))
-            chunk_audio = (wav[start_sample:end_sample].numpy(), sample_rate)
-            chunk_duration = chunk_info["end"] - chunk_info["start"]
-            best = None
-            diagnostics = []
-
-            for candidate_token_count in candidate_token_counts:
-                text_start = 0 if cursor_token == 0 else token_end_indices[cursor_token - 1]
-                text_end = token_end_indices[candidate_token_count - 1]
-                ground_truth = clean_reference_text[text_start:text_end]
-                if not ground_truth.strip():
-                    continue
-                try:
-                    with self.fa_lock:
-                        fa_res = self.fa_model.align(
-                            audio=[chunk_audio],
-                            text=[ground_truth],
-                            language=run_lang,
-                        )[0]
-                    self._assert_fa_timestamps_in_chunk(
-                        fa_res,
-                        chunk_info["start"],
-                        chunk_info["end"],
-                        req_id,
-                    )
-                    score = self._evaluate_fa_health(
-                        fa_res,
-                        chunk_duration,
-                        run_lang=run_lang,
-                    )
-                    diagnostics.append(
-                        f"候选文本单元={candidate_token_count} | FA-health={score:.3f}"
-                    )
-                    if best is None or score > best[0]:
-                        best = (score, candidate_token_count, ground_truth, fa_res)
-                except FaTimestampError:
-                    raise
-                except Exception as err:
-                    diagnostics.append(
-                        f"候选文本单元={candidate_token_count} | FA异常={err}"
-                    )
-
-            if best is None or best[0] < self.FINAL_FA_HEALTH_THRESHOLD:
-                details = "；".join(diagnostics) if diagnostics else "无有效候选"
-                raise AlignmentThresholdError(
-                    f"[纯 FA 对齐失败] chunk[{chunk_idx}] | 音频 {chunk_duration:.1f}s | {details}",
-                    diagnostics,
-                )
-
-            score, selected_token_count, ground_truth, fa_res = best
-            aligned_chunks.append((chunk_info, ground_truth, fa_res))
-            cursor_token = selected_token_count
-            log_info(
-                f"纯 FA 边界 | chunk[{chunk_idx}] | 文本单元={selected_token_count}/{total_tokens} | "
-                f"FA-health={score:.3f}",
-                req_id=req_id,
-            )
 
         verbose_json = {
             "task": "transcribe",
@@ -2268,37 +2155,29 @@ class LongAudioAlignPipeline:
             "text": clean_reference_text,
             "words": [],
         }
-        all_word_alignments = []
-        for chunk_info, ground_truth, fa_res in aligned_chunks:
-            self._assert_fa_timestamps_in_chunk(
-                fa_res,
-                chunk_info["start"],
-                chunk_info["end"],
-                req_id,
+        # rebuild 用压平后的一份；健康度评分仍用 FA 原始输出，评的是模型本身。
+        disjoint_fa_res, fa_clamped, fa_max_overlap = normalize_fa_interval_overlaps(
+            fa_res, 0.0, total_audio_duration
+        )
+        if fa_clamped:
+            log_warn(
+                f"FA 区间重叠压平 | 压平 {fa_clamped} 个词条 | 最大压平 {fa_max_overlap * 1000:.0f}ms | "
+                f"逐词估边共享时间是正常现象，压平后标点补位才落在后词起点之前",
+                req_id=req_id,
             )
-            # rebuild 用压平后的一份；健康度评分仍用 FA 原始输出，评的是模型本身。
-            disjoint_fa_res, fa_clamped, fa_max_overlap = normalize_fa_interval_overlaps(
-                fa_res, chunk_info["start"], chunk_info["end"]
-            )
-            if fa_clamped:
-                log_warn(
-                    f"FA 区间重叠压平 | chunk[{chunk_info['start']:.3f}..{chunk_info['end']:.3f}s] | "
-                    f"压平 {fa_clamped} 个词条 | 最大压平 {fa_max_overlap * 1000:.0f}ms | "
-                    f"逐词估边共享时间是正常现象，压平后标点补位才落在后词起点之前",
-                    req_id=req_id,
-                )
-            rebuilt_words = self._rebuild_words_from_ground_truth(
-                ground_truth,
-                disjoint_fa_res,
-                run_lang,
-            )
-            for word in rebuilt_words:
-                verbose_json["words"].append({
-                    "word": word["text"],
-                    "start": round(chunk_info["start"] + word["start"], 3),
-                    "end": round(chunk_info["start"] + word["end"], 3),
-                })
-            all_word_alignments.extend(fa_res)
+        rebuilt_words = self._rebuild_words_from_ground_truth(
+            clean_reference_text,
+            disjoint_fa_res,
+            run_lang,
+        )
+        for word in rebuilt_words:
+            # 纯透传只有一个 chunk，起点恒为 0，故不加偏移。
+            verbose_json["words"].append({
+                "word": word["text"],
+                "start": round(word["start"], 3),
+                "end": round(word["end"], 3),
+            })
+        all_word_alignments = list(fa_res)
 
         self._validate_subtitle_timestamps(verbose_json["words"], req_id=req_id)
         verbose_json["report"] = self._generate_diff_report(
@@ -2315,13 +2194,13 @@ class LongAudioAlignPipeline:
             diag_out=global_fa_diag,
             run_lang=run_lang,
         )
-        task_info = get_task_info(req_id)
-        file_name = task_info.get("file", "(未知)") if task_info else "(未知)"
+        file_name = os.path.basename(audio_path) if audio_path else "(未知)"
         log_block([
             "📊 最终报告 (纯 ForcedAligner 模式)",
             f"文件名       : {file_name}",
-            f"执行状态     : ✅ 成功 (FA-health: {global_fa_score:.3f})",
-            f"物理切片     : {len(physical_chunks)} 段 -> 有效对齐 {len(aligned_chunks)} 段",
+            # 本路径没有任何健康度阈值比对，FA-health 只作参考，不代表「通过了某个门槛」。
+            f"执行状态     : ✅ 已完成 (FA-health 参考值: {global_fa_score:.3f})",
+            "透传模式     : 整段音频 1 份 -> 整章文本 1 份（不切块）",
             f"字符匹配     : 原文={len(clean_reference_text)}字 | 对齐={len(verbose_json['words'])}词条",
             f"音频时长     : {total_audio_duration:.2f}s",
             f"流水线耗时   : {total_pipeline_time:.2f}s",
@@ -2403,8 +2282,7 @@ class LongAudioAlignPipeline:
             seg_count = len(verbose_json["segments"])
             char_count = len(verbose_json["text"])
 
-            task_info = get_task_info(req_id)
-            file_name = task_info.get("file", "(未知)") if task_info else "(未知)"
+            file_name = os.path.basename(audio_path) if audio_path else "(未知)"
 
             log_block([
                 f"📊 最终报告 (纯ASR模式)",

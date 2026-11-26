@@ -16,7 +16,7 @@ dependencies = [
     "zhconv==1.4.3",
     "jieba==0.42.1",             # 即时热词选词：词性标注取名词，见 term_selection.py
     "Levenshtein==0.27.5",       # 底层为 C 的高性能比对引擎，供 hotword_matching 使用
-    "epitran==1.35.3",           # IPA 转换；依赖系统 flite
+    "epitran==1.35.3",           # IPA 转换；英文等映射表要求系统 flite（由 autoInstall.sh 装）
     # —— 配置与运行时探针 ——
     "python-dotenv==1.2.4",      # 加载 .env
     "psutil==7.2.2",             # 容器 CPU/内存探针，供并发度推算

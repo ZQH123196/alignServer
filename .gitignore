@@ -16,3 +16,6 @@ timing_report.txt
 __pycache__/
 .venv/
 .pytest_cache/
+
+# 服务自己写的日志
+logs/

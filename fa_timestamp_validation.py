@@ -28,6 +28,27 @@ FA_WINDOW_OVERFLOW_MAX_SEC = 2.0
 SEAM_TIME_EPSILON = 1e-6
 
 
+# Qwen3-ForcedAligner-0.6B 单次对齐的音频上限（秒），纯透传路径用它做拒绝判据。
+# 取值来源是模型权重，不是文档：输出头 Linear(hidden, classify_num=5000)，
+# 每档 timestamp_segment_time=80ms，故时间轴最大可表达长度 = 5000 × 0.08 = 400s。
+# 超过即 argmax 找不到合法档位，时间戳必然失真。文档里的「5 分钟」不是这个口径。
+FA_MAX_AUDIO_SEC = 400.0
+
+
+def assert_within_fa_audio_limit(duration_sec):
+    """纯透传前的音频时长判据：超过 FA 可表达的时间轴直接拒绝。
+
+    不做切块降级：切块必须知道每块对应哪段文本，那是边界推断，
+    正是纯透传路径删掉的东西。
+    """
+    if duration_sec > FA_MAX_AUDIO_SEC:
+        raise ValueError(
+            f"音频时长 {duration_sec:.1f}s 超过 ForcedAligner 单次对齐上限 "
+            f"{FA_MAX_AUDIO_SEC:.0f}s。纯 ForcedAligner 模式不切块，"
+            "请在调用方按上限切分音频与文本。"
+        )
+
+
 class FaTimestampError(ValueError):
     """FA timestamps are invalid within a chunk or across the final output."""
 

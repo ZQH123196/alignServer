@@ -33,6 +33,10 @@ DEFAULT_PORT = 6008
 DEFAULT_ASR_MODEL_PATH = "Qwen/Qwen3-ASR-0.6B"
 DEFAULT_FA_MODEL_PATH = "Qwen/Qwen3-ForcedAligner-0.6B"
 
+# 本地日志文件。相对路径按本文件所在目录解析，与 .env 同处。
+# .env 里不写这一项时落到此默认值；写进去就必须能写，否则启动期直接失败。
+DEFAULT_LOGGING_FILE = "./logs/alignServer.log"
+
 # pyproject 的 requires-python 下限。与之不符的解析器组合会让 torch 的 wheel 选错。
 REQUIRED_PYTHON = (3, 12)
 
@@ -63,6 +67,7 @@ class ServerEnv:
     asr_model_path: str
     fa_model_path: str
     dashscope_apikey: str
+    logging_file: str
 
     def describe(self) -> list[str]:
         """启动日志用的配置回执。Key 只输出首尾片段，禁止明文落日志。"""
@@ -74,6 +79,7 @@ class ServerEnv:
             f"FA_MODEL_PATH={self.fa_model_path}",
             f"监听={self.host}:{self.port}",
             f"百炼 Key={masked}",
+            f"日志文件={self.logging_file}",
         ]
 
 
@@ -155,6 +161,26 @@ def _check_model_path(name: str, value: str, problems: list[str]) -> None:
         problems.append(f"{name}={value} 指向的目录不存在（模型未下载或路径写错）")
     elif not (path / "config.json").is_file():
         problems.append(f"{name}={value} 目录内没有 config.json，不是可加载的模型目录")
+
+
+def _resolve_log_path(raw: str, problems: list[str]) -> str:
+    """解析并实测日志文件可写。写不进去就在启动期失败，不留到第一个请求。
+
+    相对路径按本文件所在目录解析，不按进程 cwd —— 从 systemd、pm2、cron 启动时
+    cwd 各不相同，按 cwd 解析会让日志散落在不可预期的位置。
+    只走文件句柄，不做 os.access 探测：后者能看到的权限，在真正写入时未必成立。
+    """
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        problems.append(f"LOGGING_FILE={path} 无法写入：{exc}。日志文件不可用时不启动")
+        return str(path)
+    return str(path)
 
 
 def check_lockfile(problems: list[str]) -> None:
@@ -259,6 +285,7 @@ def load_server_env() -> ServerEnv:
     asr_model_path = _read("ASR_MODEL_PATH", DEFAULT_ASR_MODEL_PATH)
     fa_model_path = _read("FA_MODEL_PATH", DEFAULT_FA_MODEL_PATH)
     dashscope_apikey = _read_api_key()
+    logging_file_raw = _read("LOGGING_FILE", DEFAULT_LOGGING_FILE)
 
     if not host:
         problems.append(f"HOST 为空，请检查 {ENV_FILE_HINT}")
@@ -271,6 +298,7 @@ def load_server_env() -> ServerEnv:
     _check_python(problems)
     _check_model_path("ASR_MODEL_PATH", asr_model_path, problems)
     _check_model_path("FA_MODEL_PATH", fa_model_path, problems)
+    logging_file = _resolve_log_path(logging_file_raw, problems)
 
     if problems:
         raise StartupConfigError(problems)
@@ -283,6 +311,7 @@ def load_server_env() -> ServerEnv:
         asr_model_path=asr_model_path,
         fa_model_path=fa_model_path,
         dashscope_apikey=dashscope_apikey,
+        logging_file=logging_file,
     )
     return _SERVER_ENV
 

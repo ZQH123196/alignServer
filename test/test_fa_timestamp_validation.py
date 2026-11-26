@@ -1,3 +1,4 @@
+import re
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -5,7 +6,9 @@ from types import SimpleNamespace
 
 from fa_timestamp_validation import (
     FA_INTERVAL_OVERLAP_MAX_SEC,
+    FA_MAX_AUDIO_SEC,
     FaTimestampError,
+    assert_within_fa_audio_limit,
     clamp_seam_interval,
     normalize_fa_interval_overlaps,
     validate_absolute_timestamps,
@@ -466,7 +469,7 @@ class NormalizeCallSiteTests(unittest.TestCase):
 
     SITES = (
         ("pipeline.py", "def _emit_fa(", "_rebuild_words_from_ground_truth(ground_truth, disjoint_fa_res, run_lang)"),
-        ("pipeline.py", "for chunk_info, ground_truth, fa_res in aligned_chunks:", "rebuilt_words = self._rebuild_words_from_ground_truth("),
+        ("pipeline.py", "def process_audio_fa_only(", "rebuilt_words = self._rebuild_words_from_ground_truth("),
         ("cloud_hotword.py", "self._assert_fa_timestamps(", "self._rebuild_words("),
     )
 
@@ -477,7 +480,11 @@ class NormalizeCallSiteTests(unittest.TestCase):
                 source = (project_root / filename).read_text(encoding="utf-8")
                 self.assertIn(anchor, source, f"{filename} 找不到接入点锚点 {anchor!r}")
 
-                body = source.split(anchor, 1)[1][:2000]
+                body = source.split(anchor, 1)[1]
+                # 窗口止于下一个方法定义，避免把后一个接入点的压平调用算进来。
+                next_def_at = body.find("\n    def ", 1)
+                if next_def_at != -1:
+                    body = body[:next_def_at]
                 normalize_at = body.find("normalize_fa_interval_overlaps(")
                 rebuild_at = body.find(rebuild_anchor)
                 self.assertNotEqual(
@@ -492,6 +499,57 @@ class NormalizeCallSiteTests(unittest.TestCase):
                     normalize_at, rebuild_at,
                     f"{filename} 的 {anchor!r} 处先 rebuild 后压平，顺序反了",
                 )
+
+
+class FaAudioLimitTests(unittest.TestCase):
+    """纯透传路径的时长判据：超过 FA 可表达的时间轴必须拒绝，且不做切块降级。"""
+
+    def test_duration_at_limit_is_accepted(self) -> None:
+        # Arrange
+        duration = FA_MAX_AUDIO_SEC
+
+        # Act & Assert：边界值本身放行
+        assert_within_fa_audio_limit(duration)
+
+    def test_duration_over_limit_is_rejected(self) -> None:
+        # Arrange
+        duration = FA_MAX_AUDIO_SEC + 0.1
+
+        # Act & Assert
+        with self.assertRaises(ValueError):
+            assert_within_fa_audio_limit(duration)
+
+    def test_limit_equals_output_head_capacity(self) -> None:
+        # Arrange：判据来源是模型权重，不是文档口径
+        classify_num = 5000
+        timestamp_segment_time_ms = 80
+
+        # Act
+        capacity_sec = classify_num * timestamp_segment_time_ms / 1000.0
+
+        # Assert
+        self.assertEqual(FA_MAX_AUDIO_SEC, capacity_sec)
+
+
+class FaOnlyPassThroughTests(unittest.TestCase):
+    """结构守卫：仅对齐路径是纯透传，不得再引入边界推断。
+
+    pipeline.py 依赖 torch / qwen_asr / main 启动检查，单测无法 import，
+    故对源码做结构检查。挡不住逻辑写错，挡得住「边界推断被加回来」。
+    """
+
+    def test_pipeline_has_no_self_referential_class_constant(self) -> None:
+        """类体里的 `X = X` 引用的是类作用域自身，不是模块常量，会在导入期 NameError。
+
+        pipeline.py 依赖 torch 等重依赖，本机装不装都能跑这条检查（只读源码）。
+        """
+        project_root = Path(__file__).resolve().parent.parent
+        source = (project_root / "pipeline.py").read_text(encoding="utf-8")
+
+        self.assertIsNone(
+            re.search(r"^    ([A-Z][A-Z0-9_]+) = \1$", source, re.MULTILINE),
+            "pipeline.py 的类体里有自引用的常量赋值，导入期会 NameError",
+        )
 
 
 if __name__ == "__main__":

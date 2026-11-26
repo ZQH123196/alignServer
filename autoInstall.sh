@@ -2,113 +2,96 @@
 # 遇到错误立即退出
 set -e
 
+# ==========================================
+# 唯一安装入口。
+# 生产环境只跑本脚本与 start_alignServer.sh，禁止手工拼环境。
+# 设计判据：
+#   1. 依赖一律来自 uv.lock（uv sync --frozen），不是 -r pyproject.toml。
+#   2. torch 的 CPU/CUDA 变体锁文件表达不了，故在冻结同步之后单独装，
+#      装完由启动期硬件探针验证（env_config.check_device_capability）。
+#   3. 全部选择走环境变量，非交互可重跑。缺必填项立即失败，不猜默认值。
+# ==========================================
+
 echo "🚀 开始构建 Long Audio Aligner 运行环境..."
 
 # ==========================================
-# 0. 全局配置与网络环境检测 (最先确认，影响全局策略)
+# 0. 全局配置（全部走环境变量，非交互）
 # ==========================================
-echo ""
-export MyWorkDir="/root/autodl-tmp/alignServer"
-# Hugging Face 令牌只从环境读取（运行前 `export HF_TOKEN=hf_xxx`），脚本内禁止留明文。
-# Qwen 公开模型匿名可下，令牌仅用于提升 HF 限额，故缺失时警告不中断。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export MyWorkDir="${MyWorkDir:-$SCRIPT_DIR}"
+export MODEL_ROOT_DIR="${MODEL_ROOT_DIR:-$HOME/autodl-fs/models}"
+
+# DEVICE 决定 torch 变体。取值不合法立即退出，不回落默认值。
+DEVICE="${DEVICE:-cuda}"
+case "$DEVICE" in
+    cpu|cuda) ;;
+    *)
+        echo "[FATAL] DEVICE=$DEVICE 不合法，只能是 cpu 或 cuda" >&2
+        exit 1
+        ;;
+esac
+
+# 国内镜像开关。y = 启用清华镜像 / n = 官方源
+use_domestic="${USE_DOMESTIC:-y}"
+
+# 模型下载方式：hf = HuggingFace / ms = 魔搭
+DOWNLOAD_SOURCE="${DOWNLOAD_SOURCE:-hf}"
+case "$DOWNLOAD_SOURCE" in
+    hf|ms) ;;
+    *)
+        echo "[FATAL] DOWNLOAD_SOURCE=$DOWNLOAD_SOURCE 不合法，只能是 hf 或 ms" >&2
+        exit 1
+        ;;
+esac
+
+# Hugging Face 令牌只从环境读取。Qwen 公开模型匿名可下，缺失不中断。
 export HF_TOKEN="${HF_TOKEN:-}"
 if [ -n "$HF_TOKEN" ]; then
     echo "✅ 已从环境变量读取 HF_TOKEN（${#HF_TOKEN} 位）"
 else
-    echo "⚠️ 环境变量 HF_TOKEN 未设置：匿名下载可能触发 HF 限流（公开模型可忽略）"
+    echo "⚠️ HF_TOKEN 未设置：匿名下载可能触发 HF 限流（公开模型可忽略）"
 fi
-export MODEL_ROOT_DIR="/root/autodl-fs/models"
 
-# 创建目录
+# 百炼 Key。main.py 启动期无条件校验，缺失即拒绝启动，故这里必须拿到。
+DASHSCOPE_APIKEY="${DASHSCOPE_APIKEY:-${dashscope_apikey:-}}"
+
+echo "  工作目录 : $MyWorkDir"
+echo "  模型根目录: $MODEL_ROOT_DIR"
+echo "  设备     : $DEVICE"
+echo "  下载源   : $DOWNLOAD_SOURCE"
+echo "  国内加速 : $use_domestic"
+
 mkdir -p "$MyWorkDir"
 mkdir -p "$MODEL_ROOT_DIR"
 cd "$MyWorkDir"
 
-read -p "❓ 当前是否处于国内网络环境? (y: 启用镜像加速 / n: 默认直连) [默认: y]: " use_domestic
-use_domestic=${use_domestic:-y}
-
-# 预设 PyPI 镜像、GitHub 代理和源码 ZIP 下载链接
-PYPI_MIRROR=""
-QWEN_ASR_ZIP="https://github.com/QwenLM/Qwen3-ASR/archive/refs/heads/main.zip"
-
+# 国内加速：uv.lock 的 wheel URL 已钉在清华镜像，核对时跟随 USE_DOMESTIC。
+# 注意 uv.lock 的包源写死在 URL 里，装什么源由锁决定，不由这里决定。
 if [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
-    echo "⚡ 已开启国内加速模式"
-    echo "请选择要使用的 PyPI 镜像源 (输入数字序号):"
-    echo "  1) 清华大学 (默认)"
-    echo "  2) 阿里云"
-    echo "  3) 腾讯云"
-    echo "  4) 中科大"
-    echo "  5) 华为云"
-    read -p "请输入序号 [默认: 1]: " mirror_choice
-    mirror_choice=${mirror_choice:-1}
-
-    case $mirror_choice in
-        2) 
-            PYPI_MIRROR="-i https://mirrors.aliyun.com/pypi/simple/" 
-            echo "✅ 已选择: 阿里云镜像源"
-            ;;
-        3) 
-            PYPI_MIRROR="-i https://mirrors.cloud.tencent.com/pypi/simple/" 
-            echo "✅ 已选择: 腾讯云镜像源"
-            ;;
-        4) 
-            PYPI_MIRROR="-i https://pypi.mirrors.ustc.edu.cn/simple/" 
-            echo "✅ 已选择: 中科大镜像源"
-            ;;
-        5) 
-            PYPI_MIRROR="-i https://repo.huaweicloud.com/repository/pypi/simple/" 
-            echo "✅ 已选择: 华为云镜像源"
-            ;;
-        *) 
-            PYPI_MIRROR="-i https://pypi.tuna.tsinghua.edu.cn/simple" 
-            echo "✅ 已选择: 清华大学镜像源 (默认)"
-            ;;
-    esac
-
-    QWEN_ASR_ZIP="${QWEN_ASR_ZIP}"
+    export UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"
+    echo "⚡ 已启用国内加速（清华镜像）"
 else
-    echo "🌐 已开启海外直连模式"
+    export UV_DEFAULT_INDEX="https://pypi.org/simple"
+    echo "🌐 直连官方源"
 fi
 
-echo ""
-echo "📦 请选择大模型下载方式 (输入数字序号):"
-echo "  1) Hugging Face 官方直连"
-echo "  2) Hugging Face 国内镜像 (HF-Mirror) [默认]"
-echo "  3) ModelScope 魔搭社区"
-read -p "请输入序号 [默认: 2]: " dl_choice
-dl_choice=${dl_choice:-2}
+# qwen-asr 的 commit 钉法只在 pyproject.toml 声明一次，本脚本不重复写死。
 
 # ==========================================
-# 1. 前置工具检查与交互式安装
+# 1. 前置工具检查
 # ==========================================
 echo ""
 if ! command -v uv &> /dev/null; then
-    echo "⚠️  [警告] 未检测到包管理工具 uv。"
-    read -p "❓ 是否允许脚本自动为您安装 uv? (y: 使用 pip 安装 / n: 退出并手动安装) [默认: y]: " install_uv
-    install_uv=${install_uv:-y}
-    
-    if [[ "$install_uv" == "y" || "$install_uv" == "Y" ]]; then
-        echo "[*] 正在执行安装: python -m pip install uv $PYPI_MIRROR ..."
-        # 使用 python -m pip 避免多环境 pip 冲突
-        python3 -m pip install uv $PYPI_MIRROR || pip install uv $PYPI_MIRROR
-        
-        # 尝试刷新环境变量
-        [ -f $HOME/.bashrc ] && source $HOME/.bashrc
-        if ! command -v uv &> /dev/null; then
-            echo "[FATAL ERROR] uv 安装完成，但在当前环境变量 PATH 中未找到。可能安装到了用户目录（如 ~/.local/bin），请将其加入 PATH 或重启终端后再运行。"
-            exit 1
-        fi
-        echo "✅ uv 安装成功！"
-    else
-        echo "[INFO] 您取消了自动安装。请手动安装 uv 后再运行此脚本。"
-        exit 1
-    fi
-else
-    echo "✅ 检测到 uv 已安装，跳过此步骤。"
+    echo "[FATAL] 未检测到 uv。请先安装：python3 -m pip install uv" >&2
+    exit 1
 fi
+echo "✅ 检测到 uv 已安装，跳过此步骤。"
+
+# uv 缓存目录。默认 ~/.cache/uv 在只读挂载下不可写，允许用 UV_CACHE_DIR 覆盖。
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$HOME/.cache/uv}"
 
 # ==========================================
-# 2. 创建并激活虚拟环境 (修改为支持复用)
+# 2. 创建并激活虚拟环境
 # ==========================================
 echo ""
 if [ -d ".venv" ]; then
@@ -117,103 +100,122 @@ else
     echo "[*] 正在使用 uv 创建纯净虚拟环境 .venv..."
     uv venv .venv -p 3.12 --allow-existing
 fi
-source .venv/bin/activate 
+source .venv/bin/activate
 
 # ==========================================
-# 3. 硬件环境与依赖安装
+# 3. 按 uv.lock 冻结安装全部依赖
 # ==========================================
 echo ""
-read -p "❓ 当前机器是否支持并需使用 NVIDIA GPU (CUDA)? (y: 使用 GPU / n: 使用 CPU) [默认: y]: " use_gpu
-use_gpu=${use_gpu:-y}
+echo "[*] 正在执行 uv sync --frozen（依赖一律来自 uv.lock）..."
 
-INDEX_URL=""
-EXTRA_ARGS="" # 改用 EXTRA_ARGS 传参
+# torch / torchaudio 的二进制变体（CPU 与 CUDA 版本号相同）uv.lock 表达不了，
+# 故先同步其余全部依赖，再按 DEVICE 单独装 torch 生态，最后用 --no-deps 复验。
+# uv sync --frozen 会因为 torch 变体版本号不等而把它重装回锁里的 CUDA 构建，
+# 这一步的顺序不能颠倒：先 frozen，再指认 torch。
+# 复验：--inexact 让 uv 只补缺、不卸载已装的多余包。
+# 不能用默认的 exact 模式：它会把 torch 2.14.1+cpu 当成「与锁不符」卸掉，
+# 下一行装好的 CPU 变体又被抹掉，形成「装好即卸载」的死循环。
+uv sync --frozen --inexact --no-install-package torch --no-install-package torchaudio
 
-if [[ "$use_gpu" == "y" || "$use_gpu" == "Y" ]]; then
-    DEVICE_ENV="cuda"
-    INDEX_URL="--extra-index-url https://download.pytorch.org/whl/cu121"
-    EXTRA_ARGS="--extra GPU --extra hf"
-else
-    DEVICE_ENV="cpu"
-    INDEX_URL="--extra-index-url https://download.pytorch.org/whl/cpu"
-    EXTRA_ARGS="--extra CPU --extra hf"
+# qwen-asr 在锁里是 URL 依赖，uv sync --frozen 已按锁装好；此处不重装。
+
+# ==========================================
+# 4. 按 DEVICE 装 torch 生态（锁钉版本号，index 决定二进制变体）
+# ==========================================
+echo ""
+
+# 版本号取自 pyproject.toml，与 uv.lock 同源；只从 index 决定 CPU / CUDA 变体。
+TORCH_PIN="$(python -c "
+import tomllib
+deps = tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']
+for d in deps:
+    if d.startswith('torch=='):
+        print(d.split('==',1)[1])
+" )"
+TORCHAUDIO_PIN="$(python -c "
+import tomllib
+deps = tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']
+for d in deps:
+    if d.startswith('torchaudio=='):
+        print(d.split('==',1)[1])
+" )"
+
+if [ -z "$TORCH_PIN" ] || [ -z "$TORCHAUDIO_PIN" ]; then
+    echo "[FATAL] pyproject.toml 里找不到 torch== / torchaudio== 的钉版本声明" >&2
+    exit 1
 fi
+echo "  锁钉版本: torch=$TORCH_PIN torchaudio=$TORCHAUDIO_PIN"
 
-# ==========================================
-# 4. 严格按照 pyproject.toml 声明安装基础依赖
-# ==========================================
-echo ""
-echo "[*] 正在执行规范安装..."
+# CUDA 变体的 index 必须与 uv.lock 里 torch 的 CUDA 依赖同源。
+# 锁里 torch 2.14.1 依赖 cuda-toolkit 13 / nvidia-cudnn-cu13 / nccl-cu13，
+# 对应 whl/cu130。whl/cu121 上最高只有 torch 2.5.1，取 2.14.1 必然 No solution。
+CUDA_INDEX="https://download.pytorch.org/whl/cu130"
+CPU_INDEX="https://download.pytorch.org/whl/cpu"
 
-if [[ "$use_gpu" == "y" || "$use_gpu" == "Y" ]]; then
-    # 💡 GPU 模式下，强行直接指定从 PyTorch 官方源下载对应的 CUDA 12.1 版本，防止被国内镜像源的 CPU 版覆盖
-    echo "  -> 正在强制锁定安装 GPU (CUDA 12.1) 版本的 Torch 生态..."
-    uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+if [[ "$DEVICE" == "cuda" ]]; then
+    echo "  -> 正在安装 GPU (CUDA 13.0) 版本的 Torch 生态..."
+    uv pip install "torch==${TORCH_PIN}" "torchaudio==${TORCHAUDIO_PIN}" \
+        --index-url "$CUDA_INDEX"
 else
     echo "  -> 正在安装 CPU 版本的 Torch 生态..."
-    uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+    # 必须显式 --index-strategy unsafe-best-match：uv 默认只用「第一个含该包的 index」，
+    # 镜像源上的 torch 没有 +cpu 后缀，会挡住 PyTorch CPU index 上的变体。
+    uv pip install "torch==${TORCH_PIN}+cpu" "torchaudio==${TORCHAUDIO_PIN}+cpu" \
+        --index-strategy unsafe-best-match \
+        --extra-index-url "$CPU_INDEX" \
+        --index-url "$UV_DEFAULT_INDEX"
 fi
 
-# 安装剩余的常规依赖（如 fastapi, silero-vad 等）
-echo "  -> 正在安装 pyproject.toml 中的其他配套依赖..."
-uv pip install -r pyproject.toml $EXTRA_ARGS $PYPI_MIRROR
+# 断言 torch 变体真的对上了 DEVICE。这是唯一一处校验二进制变体的地方：
+# uv.lock 钉不住变体（版本号相同），启动期探针只查「CUDA 可用性是否与 DEVICE 自洽」，
+# 查不出「DEVICE=cuda 但装的是不含 CUDA 的 whl」以外的形态。
+python -c "
+import torch, sys
+device = '${DEVICE}'
+has_cuda = torch.cuda.is_available()
+want_cuda = device == 'cuda'
+if want_cuda != has_cuda:
+    sys.exit(f'[FATAL] torch 变体与 DEVICE 不符: DEVICE={device} 但 cuda_available={has_cuda}')
+print(f'  ✅ torch {torch.__version__} | cuda_available={has_cuda}')
+"
 
 # ==========================================
-# 4.5 独立安装 Flash Attention 2 (仅限 GPU)
+# 4.5 Flash Attention 2（仅 GPU，可选）
 # ==========================================
-if [[ "$use_gpu" == "y" || "$use_gpu" == "Y" ]]; then
+# 它不是必需项：pipeline.py 有 `except ImportError` 落到 sdpa，功能不受影响。
+# 故整节失败只告警、不中断。安装由用户显式打开（INSTALL_FLASH_ATTN=1），
+# 默认关闭——上游没有与 torch 2.14 + CUDA 13 匹配的预编译 wheel。
+if [[ "$DEVICE" == "cuda" && "${INSTALL_FLASH_ATTN:-0}" == "1" ]]; then
     echo ""
     echo "[*] 正在为 GPU 环境安装 Flash Attention 2..."
-    echo "    -> 准备拉取预构建包 (Wheel)"
-
-    # 如果是国内环境，尝试开启终端代理下载 GitHub 资源
-    if [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
-        if [ -f /etc/network_turbo ]; then
-            echo "    -> 🌐 检测到国内环境，开启系统代理 (/etc/network_turbo)..."
-            source /etc/network_turbo
-        else
-            echo "    -> ⚠️ 未检测到代理配置文件，尝试直连下载..."
-        fi
-    fi
-
-    # 下载并安装
-    FLASH_ATTN_WHL="flash_attn-2.8.3.post1+cu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
-    FLASH_ATTN_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/${FLASH_ATTN_WHL}"
-
-    if [ -f "$FLASH_ATTN_WHL" ]; then
-        echo "    -> ✅ 检测到 ${FLASH_ATTN_WHL} 已存在，跳过下载..."
+    # 无预编译 wheel 时会退化为源码编译，耗时较长。
+    # --no-build-isolation 是上游要求，否则会在隔离环境里重新解析 torch。
+    if uv pip install flash-attn --no-build-isolation; then
+        echo "    ✅ Flash Attention 2 安装成功"
     else
-        echo "    -> 准备下载 ${FLASH_ATTN_WHL}..."
-
-        # 自动安装 aria2c
-        if ! command -v aria2c &> /dev/null; then
-            echo "       ⚠️ 未检测到 aria2c，自动安装中..."
-            apt-get install -y aria2
-        fi
-
-        echo "       使用 aria2c (多连接加速)..."
-        aria2c -x 8 -s 8 -k 1M \
-               --auto-file-renaming=false \
-               --console-log-level=warn \
-               -o "$FLASH_ATTN_WHL" "$FLASH_ATTN_URL"
-    fi
-    uv pip install "$FLASH_ATTN_WHL"
-
-    # 安装完成后，如果是国内环境，关闭代理以免影响后续国内源（如 HF-Mirror/清华源）的访问
-    if [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
-        if [ -f /etc/network_turbo ]; then
-            echo "    -> 🛑 关闭系统代理..."
-            unset http_proxy && unset https_proxy
-        fi
+        echo "    ⚠️ Flash Attention 2 安装失败，pipeline 将回退到 sdpa（功能不受影响）"
     fi
 fi
 
 # ==========================================
-# 5. 自动补全 Qwen3-ASR 源码模块 (极速 ZIP 版)
+# 5. Qwen3-ASR 核心包
 # ==========================================
+# 它已在 uv.lock 里作为 URL 依赖钉到某个 commit，uv sync --frozen 已装。
+# 此处只校验装到的确实存在，不在脚本里重新装一遍（重装会绕过锁）。
+# sha 不在本脚本重复写死：唯一声明处是 pyproject.toml 的 URL 依赖。
 echo ""
-echo "[*] 正在极速拉取并安装 Qwen3-ASR 核心包与底层依赖..."
-uv pip install "$QWEN_ASR_ZIP" $PYPI_MIRROR $INDEX_URL
+echo "[*] 校验 Qwen3-ASR 核心包..."
+if ! python -c "import qwen_asr" 2>/dev/null; then
+    LOCKED_QWEN_URL="$(python -c "
+import tomllib
+deps = tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']
+print(next((d for d in deps if d.startswith('qwen-asr @')), '(未声明)'))
+")"
+    echo "[FATAL] qwen_asr 未安装。uv sync --frozen 未覆盖它，请检查 uv.lock 里的 URL 依赖。" >&2
+    echo "        pyproject.toml 的声明：$LOCKED_QWEN_URL" >&2
+    exit 1
+fi
+echo "    ✅ qwen_asr 已就绪"
 
 # ==========================================
 # 6. 本地化下载大模型 (Qwen) - 多选版
@@ -233,7 +235,7 @@ download_model() {
         echo "    ✅ 检测到模型 $repo_id 已存在于 $local_dir，跳过下载..."
     else
         echo "    -> 开始下载 $repo_id..."
-        if [ "$dl_choice" == "3" ]; then
+        if [ "$DOWNLOAD_SOURCE" == "ms" ]; then
             modelscope download --model="$repo_id" --local-dir "$local_dir"
         else
             # 兼容别名及标准工具
@@ -246,16 +248,13 @@ download_model() {
     fi
 }
 
-if [ "$dl_choice" == "3" ]; then
+if [ "$DOWNLOAD_SOURCE" == "ms" ]; then
     echo "[*] 正在使用 ModelScope 魔搭社区进行下载..."
-    pip install modelscope $PYPI_MIRROR
-elif [ "$dl_choice" == "2" ]; then
+elif [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
     echo "[*] 已切换至 HF-Mirror 国内镜像源，准备满速拉取模型..."
     export HF_ENDPOINT=https://hf-mirror.com
-    pip install --upgrade huggingface_hub hf-transfer $PYPI_MIRROR
 else
     echo "[*] 正在从 Hugging Face 官方直连下载模型..."
-    pip install --upgrade huggingface_hub hf-transfer $PYPI_MIRROR
 fi
 
 # 开始下载 Qwen3-ASR 及其强制对齐模型 (MS与HF仓库名一致)
@@ -267,8 +266,7 @@ download_model "Qwen/Qwen3-ForcedAligner-0.6B" "$MODEL_ROOT_DIR/Qwen/Qwen3-Force
 # ==========================================
 echo ""
 echo "[*] 正在预先下载并缓存 Silero VAD 模型..."
-uv pip install silero-vad onnxruntime
-# 不再需要 yes y | 管道拦截
+# silero-vad 已在 uv.lock 里，uv sync --frozen 已装，此处只用它触发权重缓存。
 python -c "
 from silero_vad import load_silero_vad
 load_silero_vad()
@@ -281,18 +279,28 @@ echo "✅ Silero VAD 模型已预热下载完毕！"
 echo ""
 echo "[*] 开始配置 Web 服务信息 (默认绑定 127.0.0.1:6008)..."
 
-SERVER_HOST="127.0.0.1"
-SERVER_PORT="6008"
+SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
+SERVER_PORT="${SERVER_PORT:-6008}"
+# 日志文件写在项目目录下，与 .env 同级。相对路径由 main.py 按自身目录解析。
+LOGGING_FILE_VALUE="${LOGGING_FILE:-./logs/alignServer.log}"
 
 # cloud ASR 分支（qwen-audio-3.1-asr-flash-filetrans）所需；main.py 启动期强校验，缺失即拒绝启动
-read -p "🔑 请输入百炼 API Key (dashscope_apikey，可直接回车沿用环境变量或稍后手工写入 .env): " DASHSCOPE_APIKEY
-DASHSCOPE_APIKEY="${DASHSCOPE_APIKEY:-${dashscope_apikey:-}}"
+if [ -z "$DASHSCOPE_APIKEY" ]; then
+    echo "[FATAL] 缺少百炼 API Key。main.py 启动期无条件校验，缺失即拒绝启动。" >&2
+    echo "        请在运行前 export DASHSCOPE_APIKEY=sk-... 或 export dashscope_apikey=sk-..." >&2
+    exit 1
+fi
 
 echo "[*] 正在生成 .env 环境变量配置文件..."
 
-cat <<EOF > .env
+# 已存在的 .env 不覆盖：运维手工改过的 HOST / PORT / Key 必须保留。
+# 要按这次的环境变量重写，先手动删掉 .env 再跑本脚本。
+if [ -f ".env" ]; then
+    echo "⚠️ .env 已存在，跳过生成。如需按本次环境变量重写，请先删除 .env。"
+else
+    cat <<EOF > .env
 # 硬件加速模式
-DEVICE=$DEVICE_ENV
+DEVICE=$DEVICE
 
 # 本地化模型绝对路径
 ASR_MODEL_PATH=$MODEL_ROOT_DIR/Qwen/Qwen3-ASR-0.6B
@@ -304,17 +312,33 @@ dashscope_apikey=$DASHSCOPE_APIKEY
 # FastAPI 服务配置
 HOST=$SERVER_HOST
 PORT=$SERVER_PORT
+
+# 本地日志文件（相对路径按 main.py 所在目录解析）。启动期会实测可写，写不进去即拒绝启动
+LOGGING_FILE=${LOGGING_FILE_VALUE:-./logs/alignServer.log}
 EOF
+    echo "    ✅ 已写入 .env"
+fi
 
-# 注意：swapoff 需要 root 权限，如果在非 root 环境执行会报错导致脚本退出（因为上方开启了 set -e）
-# 如果用户没有 root 权限，可以加上 || true 防止脚本意外中断
+# swapoff 需要 root 权限。非 root 下失败不应中断安装。
 echo "正在尝试关闭 swap 内存交互，避免数据从内存卸载到硬盘..."
-swapoff -a || true 
+swapoff -a || true
 
-# IPA 依赖，epitran 库所需
-apt-get install -y flite
+# flite 是 epitran 的系统依赖（epitran 是 pyproject 的硬依赖），由 apt 提供。
+# 缺失时对齐模式不可用，故这里装不上就退出，不把问题留到运行时。
+if command -v flite >/dev/null 2>&1; then
+    echo "✅ flite 已存在：$(command -v flite)"
+else
+    echo "[*] 正在安装 flite（epitran 的系统依赖）..."
+    sudo apt-get install -y flite
+    command -v flite >/dev/null 2>&1 || {
+        echo "[FATAL] flite 安装后 PATH 中仍找不到。epitran 无法工作。" >&2
+        exit 1
+    }
+    echo "✅ flite 安装完成：$(command -v flite)"
+fi
+
 echo ""
 echo "✅ 环境配置与所有模型（Qwen & VAD）全量下载完毕！"
-echo "🚀 正在启动服务..."
-# uv run --no-project python main.py
-source .venv/bin/activate && python main.py
+echo ""
+echo "下一步：./start_alignServer.sh"
+echo "本脚本不起服务。启动的唯一入口是 start_alignServer.sh。"

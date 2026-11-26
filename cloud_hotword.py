@@ -29,7 +29,7 @@ from term_selection import select_hotword_terms
 import sys as _sys
 if 'main' not in _sys.modules and '__main__' in _sys.modules:
     _sys.modules['main'] = _sys.modules['__main__']
-from main import log, log_info, log_warn, log_error, log_block, get_task_info
+from main import log, log_info, log_warn, log_error, log_block
 
 # Cloud ASR (qwen-audio-3.1-asr-flash-filetrans 等) 的语言代码契约。
 # 来源：https://platform.qianwenai.com/docs/api-reference/speech-recognition/fun-asr-recording/restful-api
@@ -1237,8 +1237,7 @@ class CloudHotwordAlignPipeline:
         }
 
         total_pipeline_time = time.time() - pipeline_start_time
-        task_info = get_task_info(req_id)
-        file_name = task_info.get("file", "(未知)") if task_info else "(未知)"
+        file_name = os.path.basename(audio_path) if audio_path else "(未知)"
 
         log_block([
             "📊 最终报告 (Cloud Hotword 对齐模式)",
