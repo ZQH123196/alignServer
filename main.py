@@ -56,7 +56,7 @@ from env_config import (
     check_lockfile,
     load_server_env,
 )
-from utils import get_container_available_memory, normalize_multipart_line_endings
+from utils import get_container_available_memory, normalize_multipart_line_endings, with_chapter_identity, audio_defect_error_detail
 import transformers
 transformers.logging.set_verbosity_error()
 # set_verbosity_error() 连带关掉权重加载进度条，静默只能靠阶段日志兜住。
@@ -274,7 +274,7 @@ boot(f"启动检查通过 | 目标监听 {SERVER_ENV.host}:{SERVER_ENV.port} | �
 
 # [修改点 1]：引入我们新定义的 AlignmentThresholdError
 from pipeline import LongAudioAlignPipeline, AlignmentThresholdError, build_sampling_params
-from cloud_hotword import CloudHotwordAlignPipeline, resolve_language as resolve_cloud_language
+from cloud_hotword import CloudHotwordAlignPipeline, AudioDefectError, resolve_language as resolve_cloud_language
 from fa_timestamp_validation import FaTimestampError
 boot("业务模块导入完成 | 组装 FastAPI 应用")
 
@@ -563,7 +563,13 @@ async def openai_asr_endpoint(
                     )
                     log_queue_snapshot(req_id=req_id, level="WARN")
                     log_warn(str(e), req_id=req_id)
-                    raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "alignment_threshold_error"}})
+                    raise HTTPException(status_code=400, detail={
+                        "error": {
+                            "message": with_chapter_identity(str(e), file.filename),
+                            "type": "alignment_threshold_error",
+                            "file": file.filename or "(未命名)",
+                        }
+                    })
 
                 except FaTimestampError as e:
                     # 运行期 FA 对齐失败（时间戳校验未通过）：不是请求参数问题，
@@ -577,7 +583,13 @@ async def openai_asr_endpoint(
                         req_id=req_id,
                     )
                     log_queue_snapshot(req_id=req_id, level="ERROR")
-                    raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "fa_timestamp_error"}})
+                    raise HTTPException(status_code=400, detail={
+                        "error": {
+                            "message": with_chapter_identity(str(e), file.filename),
+                            "type": "fa_timestamp_error",
+                            "file": file.filename or "(未命名)",
+                        }
+                    })
 
                 except Exception as e:
                     is_oom = False
@@ -608,16 +620,36 @@ async def openai_asr_endpoint(
                         await asyncio.sleep(2)
                     else:
                         mark_failed(req_id)
+                        if isinstance(e, AudioDefectError):
+                            # 音频缺陷：裁决的是这份音频（覆盖率不足等），不是请求参数。
+                            # 必须与普通 400 分开类型 —— 调用方据此作废本章产物并重生成音频；
+                            # 混进 invalid_request_error 会被当成参数问题直接记失败，
+                            # 回退重跑额度永远用不上（2026-10-28 第 34 章）。
+                            first_line = str(e).split("\n", 1)[0]
+                            log_error(
+                                f"请求被前置校验拒绝（音频缺陷） | {file.filename or '(未命名)'} | "
+                                f"reason={e.reason} | {first_line}",
+                                req_id=req_id,
+                            )
+                            raise HTTPException(status_code=400, detail=audio_defect_error_detail(
+                                str(e), file.filename, e.reason,
+                            ))
                         if isinstance(e, ValueError):
                             # ValueError 一律是业务前置条件不满足（覆盖率校验、热词不足等），
                             # 属可预期的 400，打堆栈只会让人误判为代码 bug；
                             # 详细诊断已由抛错处 log_block 过，这里只补一行落点指引。
                             first_line = str(e).split("\n", 1)[0]
                             log_error(
-                                f"请求被前置校验拒绝 | {type(e).__name__}: {first_line}",
+                                f"请求被前置校验拒绝 | {file.filename or '(未命名)'} | {type(e).__name__}: {first_line}",
                                 req_id=req_id,
                             )
-                            raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "invalid_request_error"}})
+                            raise HTTPException(status_code=400, detail={
+                                "error": {
+                                    "message": with_chapter_identity(str(e), file.filename),
+                                    "type": "invalid_request_error",
+                                    "file": file.filename or "(未命名)",
+                                }
+                            })
 
                         # 其他是真正的代码层面 Bug，保留堆栈打印方便排查
                         log_error(

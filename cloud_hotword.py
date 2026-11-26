@@ -48,6 +48,22 @@ from main import log, log_info, log_warn, log_error, log_block, get_task_info
 # 其余语言需先验证 term_selection / norm_for_match 的行为）。
 SUPPORTED_LANGUAGES = {"zh", "en"}
 
+
+class AudioDefectError(ValueError):
+    """对齐侧判定的「音频缺陷」：音频内容与参考文本不符，不是请求参数问题。
+
+    与普通 `ValueError` 分开，是因为两者的处置相反：
+    - 普通 `ValueError` = 前置条件不满足（参数、语言、模型名），调用方改请求才有意义；
+    - 本类 = 这份音频本身不可用，调用方应作废本章产物并重生成音频。
+
+    `main.py` 据此返回 400 + `type=audio_defect`，调用方（`gen-tts`）读 `type` 决定回退重跑。
+    继承 `ValueError` 是兜底：未升级的调用方仍按普通 400 处理，不会崩在类型上。
+    """
+
+    def __init__(self, message, reason="coverage-gap"):
+        super().__init__(message)
+        self.reason = reason
+
 LANGUAGE_ALIASES = {
     "chinese": "zh",
     "english": "en",
@@ -106,7 +122,7 @@ FA_CHUNK_PAD_SEC = FA_BOUNDARY_JITTER_SEC
 # 补位率 5.32%（阈值 10%），却有一段 15.48s 的空档和 71 个连续零时长 token。
 #
 # 修复单位是**块**，不是 token：块内时间轴缺口只能按原文 token 长度摊平，逐 token
-# 猜时间没有依据。因此均分判据、容差带、每请求可容忍的坏块上限全部留在本文件，
+# 猜时间没有依据。因此修复判据、容差带、每请求可容忍的坏块上限全部留在本文件，
 # 客户端只读响应里的 `report.align.defect` 是否存在，不认识块结构。
 #
 # 上限写在这里而不是客户端配置：分块是服务端内部概念，客户端无从知道本次请求被切成
@@ -123,7 +139,7 @@ CHUNK_RATE_BAND_HIGH = 1.5
 # 说明这段音频里的发音没有被 FA 覆盖，块内必然存在零时长区段。
 CHUNK_COVERAGE_TOLERANCE_SEC = 1.0
 
-# 均分后单个 token 的最小跨度（秒）。低于它说明该块 token 密度远超音频容量，
+# 重摊后单个 token 的最小跨度（秒）。低于它说明该块 token 密度远超音频容量，
 # 摊平会把时间轴压成零时长，同样不可用。
 CHUNK_TOKEN_MIN_SPAN_SEC = 0.001
 
@@ -131,7 +147,7 @@ CHUNK_TOKEN_MIN_SPAN_SEC = 0.001
 #
 # 为什么不是「存在一个就算」：FA 逐字估边，零星给出 start == end 是常态而非故障
 # （第 6 章整章补位率 5.32%，散落在各块里）。实测 2026-10-27 单章验证：按「存在即坏」
-# 判定时 16 块里 12 块被判坏，全部误报 —— 那个判据把正常块当成坏块去均分，
+# 判定时 16 块里 12 块被判坏，全部误报 —— 那个判据把正常块当成坏块去推平，
 # 反而毁掉了本来准确的块内时间。真正的故障形态是**成段**零时长（第 6 章实测
 # 71 个连续零时长 token），故判据只认连续段。
 #
@@ -140,6 +156,19 @@ CHUNK_TOKEN_MIN_SPAN_SEC = 0.001
 # 判据本身是绝对个数而不是比例：块内 token 规模在百级，5 个连续零时长在任何语言里
 # 都已经是「FA 放弃这一段」而不是零星估边。
 CHUNK_ZERO_RUN_MIN = 5
+
+# 单块「无词覆盖」有效字数的下限（字）。达到它才判块坏。
+#
+# 语义：这些字没有任何 FA 词覆盖。可能是 FA 没给出它们的词，也可能是给出的词无法
+# 按文本对回原文（数字串、面板串、中英混排）。它们的时长只能由前后锚点夹出来，
+# 块内那一段不可信。
+#
+# 为什么与零时长阈值分开、且取 10：2026-10-28 第 8 章同一章两次对齐，云端 ASR
+# 覆盖率都是 98.6% / 98.4%（说明音频确实念了这些面板行），而 FA 在该块只给出
+# 68 个词 / 118 字，三块分别有 18、5、15 字没对上词。差额来自 FA 侧，不是音频缺字。
+# 用 5 会把这类块成批判坏，进而整章作废、白跑一轮 tts。
+# 判据仍是绝对个数：块内有效字在百级，10 个字在任何语言里都已是「这段没对上词」。
+CHUNK_UNCOVERED_MIN_CHARS = 10
 
 # 词锚定的前跳上限（字符）。FA 偶尔在一处吞掉几个字，后一个词仍要锚回原位，故允许
 # 越过缺口去匹配；但跳太远说明这条词和原文对不上，宁可不锚、交给缺口夹 ——
@@ -459,6 +488,26 @@ def _fa_text(item):
     return getattr(item, "text", "") or ""
 
 
+def format_chunk_word_order(ground_truth, fa_words, word_spans):
+    """块内词序对照：FA 回了哪些词、其中哪些没能对回原文。
+
+    判「FA 丢词」还是「锚定拒绝」只有这一份证据：
+    - 方块该段的词本来就不在 `FA词文本` 里 → 模型侧丢词（属于音频与模型的比对结果）；
+    - 词都在 `未对位词文本` 里 → `_locate_word` 的词边界判定拒绝了它，不是模型丢词。
+
+    `word_spans` 与 `fa_words` 一一对应，定位失败为 `None`（见 `_rebuild_words`）。
+    """
+    pairs = [(_fa_text(word), span) for word, span in zip(fa_words, word_spans)]
+    words = [text for text, _ in pairs if text]
+    unlocated = [text for text, span in pairs if text and span is None]
+    return (
+        f"FA词={len(words)} 未对位词={len(unlocated)} | "
+        f"未对位词文本：「{'|'.join(unlocated) or '无'}」 | "
+        f"FA词文本：「{'|'.join(words) or '无'}」 | "
+        f"块原文：「{ground_truth}」"
+    )
+
+
 def _same_word_class(left, right):
     """两个相邻字符是否属于同一个「词单位」。
 
@@ -678,6 +727,9 @@ def format_coverage_diagnosis(
         f"参考文本 {ref_len} 个有效字；ASR 转写 {asr_len} 个有效字，能对上 {matched} 个（{ratio:.1%}）。",
         "「有效字」= 去掉标点、空格，并把中文数字转成阿拉伯数字后的字。",
         f"单段缺失超过 {allowed} 字才判失败。",
+        # 分块是后续强制对齐的窗口约束，不参与本判定。不写这一句，调用方会以为
+        # 「整章缺失」该由坏块修复兜住（2026-10-28 第 34 章）。
+        "本判定在切块之前按整章比对；分块与坏块修复只修块内时间戳，不吸收整章文本缺失。",
     ]
     for item in offenders:
         label = GAP_KIND_LABEL.get(item["kind"], item["kind"])
@@ -816,7 +868,9 @@ class CloudHotwordAlignPipeline:
             )
             # 异常文案直接用人读诊断：不拼内部指标名与 reason code，
             # 调用方（WebUI / 节点错误面板）读到的就是完整解释。
-            raise ValueError(coverage_diagnosis)
+            # 用 AudioDefectError 而不是 ValueError：覆盖率不足裁决的是这份音频，
+            # 调用方要据此回退重生成音频，而不是把本章当参数问题直接记失败。
+            raise AudioDefectError(coverage_diagnosis)
 
         log_info(
             f"ASR 文本覆盖 OK | 覆盖率={coverage['coverageRatio']:.1%} | "
@@ -977,7 +1031,7 @@ class CloudHotwordAlignPipeline:
         # ── 第一趟：逐块 FA，只算不判 ─────────────────────────────
         # 修复判据要用「本次请求内未判坏的块」实时标定参考语速，而参考语速只有在
         # 所有块都对齐完才齐备。故 FA 与输出拆成两趟：第一趟只产词流与结构诊断，
-        # 第二趟才决定均分并落流。
+        # 第二趟才决定修复并落流。
         for chunk in chunks:
             audio_start_sec = chunk["audioStartMs"] / 1000.0
             audio_end_sec = chunk["audioEndMs"] / 1000.0
@@ -1074,7 +1128,7 @@ class CloudHotwordAlignPipeline:
 
             verdict, valid_token_count = self._diagnose_chunk(
                 ground_truth, rebuilt_words, disjoint_fa_res, chunk_dur, run_lang,
-                rebuild_stats["unanchored"],
+                rebuild_stats["uncovered"],
             )
             chunk_records.append({
                 "index": chunk["index"],
@@ -1094,33 +1148,40 @@ class CloudHotwordAlignPipeline:
             fa_diag.append(
                 f"chunk[{chunk['index']}] {audio_start_sec:.1f}-{audio_end_sec:.1f}s ({chunk_dur:.1f}s) "
                 f"原文[{orig_start}:{orig_end}]={orig_end - orig_start}字 FA词数={len(fa_res)}"
-                f" 已锚={rebuild_stats['located_words']} 未锚字={rebuild_stats['unanchored']}"
+                f" 已对位={rebuild_stats['located_words']} 无词覆盖={rebuild_stats['uncovered']}"
                 + (f" ⚠️{verdict}" if verdict else "")
             )
+            if verdict:
+                # 判坏必须有据可查：词表少 = FA 丢词；词在但未对位 = 锚定边界拒绝。
+                log_warn(
+                    f"[块词序] chunk[{chunk['index']}] "
+                    + format_chunk_word_order(ground_truth, disjoint_fa_res, rebuild_stats["word_spans"]),
+                    req_id=req_id,
+                )
 
-        # ── 第二趟：判缺陷、均分坏块、按序落流 ────────────────────
+        # ── 第二趟：判缺陷、修复坏块、按序落流 ────────────────────
         align_defect, repaired_indexes = self._decide_chunk_repairs(chunk_records, req_id)
         for record_index, record in enumerate(chunk_records):
             kept_words = record["kept"]
             if record["index"] in repaired_indexes:
-                # 均分起点取前一块已输出的最大 end：重叠区由前块输出，均分必须从它之后开始，
-                # 否则接缝处直接时间回退（见 `_repair_chunk_words` 的说明）。
+                # 块首窗口取前一块已输出的最大 end，块尾窗口取下一块首个保留词的起点：
+                # 这两条只兜住块首/块尾的缺陷段，块内其余窗口一律取邻居时间
+                # （见 `_repair_chunk_words` 的说明）。
                 prev_max_end = last_emitted[2] if last_emitted is not None else None
                 start_sec = 0.0 if prev_max_end is None else max(0.0, prev_max_end - record["audio_start"])
-                # 均分终点取下一个块首个保留词的起点：不越过下一个块的估计，接缝才不会倒流。
                 next_record = chunk_records[record_index + 1] if record_index + 1 < len(chunk_records) else None
                 next_first_abs = next_record["first_kept_start_abs"] if next_record is not None else None
                 end_sec = None if next_first_abs is None else max(0.0, next_first_abs - record["audio_start"])
                 repaired_words = self._repair_chunk_words(
-                    record["ground_truth"], record["duration"], run_lang,
+                    record["ground_truth"], record["rebuilt"], record["duration"], run_lang,
                     keep_from=record["keep_from"], start_sec=start_sec, end_sec=end_sec,
                 )
                 if repaired_words is None:
-                    # 判定与摊平前提不同（判定只看块窗口，摊平还要扣掉前块已输出与下一块保留词
-                    # 之间的可用窗口），窗口被挤没时摊不平。按 `zero-valid-token` 判缺陷并把
-                    # 原流留下 —— 崩掉会把「一个小块摊不平」升级成整章无产物。
+                    # 缺陷段两侧的窗口撑不住最小跨度（窗口被挤没或密度过高），修不了。
+                    # 按 `zero-valid-token` 判缺陷并把原流留下 —— 崩掉会把「一个块修不了」
+                    # 升级成整章无产物。
                     message = (
-                        f"chunk[{record['index']}] 可用窗口不足，无法摊平"
+                        f"chunk[{record['index']}] 缺陷段窗口不足以摊开"
                         f"（有效={record['valid_tokens']} | 时长={record['duration']:.3f}s | "
                         f"起点={start_sec:.3f}s | 已跳过={record['keep_from']}字）"
                     )
@@ -1271,7 +1332,7 @@ class CloudHotwordAlignPipeline:
     def _tokenize_reference(self, ground_truth, lang):
         r"""按语言切参考文本 token，返回 (tokens, is_valid_token)。
 
-        token 切分是**唯一来源**：rebuild、trim、块诊断、均分四处必须用同一套切法，
+        token 切分是**唯一来源**：rebuild、trim、块诊断、修复四处必须用同一套切法，
         否则「有效 token 数」在三处各有各的答案，判据互相对不上。
 
         切法（与客户端 `repairWordTimestamps` 同构，改一侧必须同批改另一侧）：
@@ -1295,14 +1356,14 @@ class CloudHotwordAlignPipeline:
 
         return tokens, is_valid_token
 
-    def _diagnose_chunk(self, ground_truth, rebuilt_words, fa_words, chunk_duration, lang, unanchored):
+    def _diagnose_chunk(self, ground_truth, rebuilt_words, fa_words, chunk_duration, lang, uncovered):
         """结构判定：本块的词流能否直接用于字幕。返回 (原因或 None, 有效 token 数)。
 
         只判**结构**，不判语速（语速要等全部块对齐完才能标定，见 `_decide_chunk_repairs`）。
         三条判据都只看有效 token，纯标点段的零时长是正常形态，不参与判定：
 
-        1. 未锚定有效字符达到 `CHUNK_ZERO_RUN_MIN` 个 —— FA 没给出这些字的词，
-           它们的时间只能由缺口夹估算，块内时间轴不可信。
+        1. 无词覆盖的有效字达到 `CHUNK_UNCOVERED_MIN_CHARS` 个 —— 这些字没有对应的
+           FA 词，时间只能由缺口夹估算，块内时间轴不可信。
            **不再用「字符数 vs FA 词数」**：FA 的输出单位是词，一串阿拉伯数字是
            一个词，拿字符数比词数会把数字块全判坏（2026-10-27 事故的直接原因）。
         2. 零时长有效 token 的**连续段**达到 `CHUNK_ZERO_RUN_MIN` 个 —— 块内时间轴断了。
@@ -1316,14 +1377,14 @@ class CloudHotwordAlignPipeline:
             # 整块没有可发音 token：没有时间可摊，也没有零时长有效 token 可言。
             return None, 0
 
-        # 未锚定的字只能靠前后夹，数量多说明 FA 确实没对上这一段。
-        if unanchored >= CHUNK_ZERO_RUN_MIN:
-            return f"unanchored({unanchored})", valid_count
+        # 无词覆盖的字只能靠前后夹，数量多说明 FA 确实没对上这一段。
+        if uncovered >= CHUNK_UNCOVERED_MIN_CHARS:
+            return f"无词覆盖({uncovered}字)", valid_count
 
         # FA 一个词都没给、这块却有声：整块时间只能靠缺口夹铺满，等于没有对齐。
-        # 不能等 `unanchored >= 5` 兜住 —— 短块（块尾 2~4 个字）会静默放行。
+        # 不能等 `无词覆盖 >= 10` 兜住 —— 短块（块尾 2~4 个字）会静默放行。
         if not fa_words:
-            return f"unanchored({valid_count})", valid_count
+            return f"无词覆盖({valid_count}字)", valid_count
 
         # 成段的零时长有效 token：FA 对这整段没给出对齐区间，块内时间轴断了。
         # 零星零时长不算（见 CHUNK_ZERO_RUN_MIN 的说明）。
@@ -1351,7 +1412,7 @@ class CloudHotwordAlignPipeline:
         return None, valid_count
 
     def _decide_chunk_repairs(self, records, req_id):
-        """判定坏块能否均分修复，返回 (defect 或 None, 需均分的块号集合)。
+        """判定坏块能否修复，返回 (defect 或 None, 需修复的块号集合)。
 
         参考语速**在本次请求内实时标定**，不落盘、不预标定、不跨请求复用：
 
@@ -1402,7 +1463,7 @@ class CloudHotwordAlignPipeline:
             if step < CHUNK_TOKEN_MIN_SPAN_SEC:
                 reason = (
                     f"chunk[{index}] {window} | {structural} | "
-                    f"均分步长 {step * 1000:.3f}ms < {CHUNK_TOKEN_MIN_SPAN_SEC * 1000:.0f}ms"
+                    f"平均步长 {step * 1000:.3f}ms < {CHUNK_TOKEN_MIN_SPAN_SEC * 1000:.0f}ms"
                     f"（{valid} token / {duration:.3f}s）"
                 )
                 candidates.append(("zero-valid-token", reason))
@@ -1411,7 +1472,7 @@ class CloudHotwordAlignPipeline:
             if chapter_rate is None:
                 log_warn(
                     f"[块不修] chunk[{index}] {window} | {structural} | "
-                    f"没有可用参考块，无从判断均分是否合理",
+                    f"没有可用参考块，无从判断修复是否合理",
                     req_id=req_id,
                 )
                 continue
@@ -1443,7 +1504,7 @@ class CloudHotwordAlignPipeline:
         # 汇总每请求都记：判缺陷时它是上下文，不判缺陷时它是「本轮修了几个块」的唯一收口。
         log_info(
             f"[块修复汇总] 块数={len(records)} | 参考块={len(good_records)} | "
-            f"坏块={len(bad_records)} | 均分块={len(repaired)} | 章参考语速="
+            f"坏块={len(bad_records)} | 修复块={len(repaired)} | 章参考语速="
             + (f"{chapter_rate:.2f}token/s" if chapter_rate is not None else "N/A"),
             req_id=req_id,
         )
@@ -1462,36 +1523,43 @@ class CloudHotwordAlignPipeline:
         log_warn(f"[块结构原因] 坏块 {len(bad_records)} 个 | {structural_digest}", req_id=req_id)
         return {"reason": reason, "message": message}, repaired
 
-    def _repair_chunk_words(self, ground_truth, chunk_duration, lang, keep_from=0.0, start_sec=0.0, end_sec=None):
-        r"""把块窗口按**有效 token 长度**加权均分，只输出**本次真正要输出**的那段词条。
+    def _repair_chunk_words(self, ground_truth, rebuilt_words, chunk_duration, lang,
+                            keep_from=0.0, start_sec=0.0, end_sec=None):
+        r"""把块内的缺陷段就地重摊，保留已对位词条的观测时间。
 
         只在结构判定为坏块、且语速落在容差带内时调用（判定在 `_decide_chunk_repairs`）。
 
-        两个入参缺一不可：
+        ## 为什么不是整块推平
 
-        - `keep_from`：块内已被前一个块输出过的字符数。热词分块的相邻窗口文本互相重叠，
-          重叠区由前一个块输出，本块必须从它之后才开始（与 `_trim_rebuilt_words` 同一条规则：
-          token 末尾落在 `keep_from` 之前即丢）。
-        - `end_sec`：本块可用时间窗的终点（块内相对秒）。传下一个块首个保留词的起点 ——
-          均分若一直铺到块窗口终点，本块尾部就会推到下一个块的估计之后，接缝处直接变成
-          时间回退（2026-10-27 实测：ch8 chunk[2] 尾部铺到 46.86s，而 chunk[3] 的首个
-          保留词在 46.22s，回退 0.64s 越过 0.5s 容差，整章 Fail-Fast）。
-        - `start_sec`：本块可用时间窗的起点（块内相对秒）。传前一个块已输出的最大 end，
-          均分从那里开始 —— 否则均分起点会**早于**前块已输出的时间，接缝处立刻变成时间回退，
-          被 `_enforce_seam_monotonicity` 判成锚点错位（2026-10-27 实测：单章验证时
-          chunk[1] 的首个保留词落在 18.833s，而前块已输出到 19.700s，回退 0.867s 直接 Fail-Fast）。
-          不靠事后钳制吸收：钳制只允许 0.5s 抖动，而整块均分能造成的回退远大于它。
+        坏块的缺陷通常是局部的：2026-10-28 第 8 章 chunk[2] 有 80 个有效字，其中 62 个
+        本来有 FA 的观测时间，只有 18 个无词覆盖。整块均分会为了这 18 个字把那 62 个
+        可信时间一起推翻。修复只动缺陷段，其余词条原样保留。
 
-        规则（多语言共用，见 README「多语言约束」）：
-        - 权重 = token 字符数。中文逐字切分，每 token 恒为 1，退化为均分；英文按词切分，
-          12 字母的词拿到的时长长于 2 字母的词 —— 均分不等于公平，长度才是可比的量。
-        - 每个有效 token 至少 `CHUNK_TOKEN_MIN_SPAN_SEC`。
-        - 标点不占时间：继承前一个有效 token 的 end（段首标点继承窗口起点）。
-        - 文本一个字不改，只改时间；输出与 `_trim_rebuilt_words` 之后同形，直接进接缝钳制。
+        ## 只修一种缺陷：连续零时长有效 token
 
-        无有效 token 或时间不够摊时返回 None，由调用方判缺陷。
+        - 无词覆盖的字在 `_rebuild_words` 里已按最近两个锚点摊过，这里不再动。
+        - 标点的零时长是「不占时间」的继承形态，不是缺陷。
+        - 零时长有效 token 说明 FA 对这一段没给区间，只能由「前一个非零 end →
+          后一个非零 start」之间的窗口按 token 长度加权摊出。
 
-        多语言：权重取 token 字符数，标点不占时间，切分走 `_tokenize_reference`。
+        局部窗口的兜底：段前没有锚点时用 `start_sec`（前块已输出最大 end），段后没有
+        锚点时用 `end_sec` / 块窗口终点。`start_sec` 只作用于块首段，块内其余段一律
+        取邻居的时间 —— 否则整块会被平移。
+
+        入参：
+
+        - `rebuilt_words`：`_rebuild_words` 的整块输出（未裁剪）。本函数按 `keep_from`
+          自己裁剪，规则与 `_trim_rebuilt_words` 相同（token 末尾落在 `keep_from` 之前即丢）。
+        - `start_sec` / `end_sec`：块首 / 块尾的窗口边界（块内相对秒）。传前一块已输出的
+          最大 end 与下一块首个保留词的起点，接缝才不会倒流。
+
+        ## 规则（多语言共用，见 README「多语言约束」）
+
+        - 权重 = token 字符数。中文逐字切分，每 token 恒为 1；英文按词切分，长词长于短词。
+        - 每个有效 token 至少 `CHUNK_TOKEN_MIN_SPAN_SEC`；窗口撑不住时返回 None，由调用方判缺陷。
+        - 标点不占时间：继承前一个有效 token 的 end（块首标点跟块首窗口对齐）。
+        - 文本一个字不改，只改时间。
+
         **改本函数前先读 README「多语言约束」一节。**
         """
         tokens, is_valid_token = self._tokenize_reference(ground_truth, lang)
@@ -1500,52 +1568,90 @@ class CloudHotwordAlignPipeline:
 
         window_start = max(0.0, start_sec)
         window_end = chunk_duration if end_sec is None else min(chunk_duration, end_sec)
-        if window_end <= window_start:
-            # 上限比起点还早：说明下一个块的估计早于本块已输出的位置，
-            # 退回到整块窗口，交给接缝钳制处置（它只吸收小抖动，大偏差仍会抛）。
+        if window_end < window_start:
+            # 上限比起点还早：说明下一个块的估计早于本块已输出的位置。块尾退回窗口终点，
+            # 交给接缝钳制处置（它只吸收小抖动，大偏差仍会抛）。
             window_end = chunk_duration
-        window = window_end - window_start
-        if window <= 0:
-            return None
 
-        # 与 `_trim_rebuilt_words` 同一条保留规则：token 末尾落在 keep_from 之前即丢。
-        # 前缀和而非常量重算：块内 token 可达数百，逐 token 重算会变成平方级热点。
-        kept_indexes = []
+        # 与 `_trim_rebuilt_words` 同一条保留规则，前缀和而非常量重算。
+        entries = []
         char_cursor = 0
-        for index, token in enumerate(tokens):
+        for token, word in zip(tokens, rebuilt_words):
             char_cursor += len(token)
-            if char_cursor > keep_from:
-                kept_indexes.append(index)
-        if not kept_indexes:
+            if char_cursor <= keep_from:
+                continue
+            entries.append({
+                "text": token,
+                "start": float(word["start"]),
+                "end": float(word["end"]),
+                "valid": is_valid_token(token),
+            })
+        if not entries:
             return []
 
-        valid_indexes = [i for i in kept_indexes if is_valid_token(tokens[i])]
-        if not valid_indexes:
-            # 剩余部分全是标点：它们不占时间，一起塌到窗口起点。
-            return [{"text": tokens[i], "start": window_start, "end": window_start} for i in kept_indexes]
+        def has_anchor(entry):
+            return entry["valid"] and entry["end"] > entry["start"]
 
-        weights = [float(max(1, len(tokens[i]))) for i in valid_indexes]
-        total_weight = sum(weights)
-        if total_weight <= 0:
-            return None
-        if window * (min(weights) / total_weight) < CHUNK_TOKEN_MIN_SPAN_SEC:
-            return None
+        # 只重摊「有效且零时长」的连续段。
+        total = len(entries)
+        index = 0
+        while index < total:
+            if not (entries[index]["valid"] and not has_anchor(entries[index])):
+                index += 1
+                continue
+            run_end = index
+            while run_end + 1 < total:
+                nxt = entries[run_end + 1]
+                if nxt["valid"] and not has_anchor(nxt):
+                    run_end += 1
+                else:
+                    break
+            left = next(
+                (entries[k]["end"] for k in range(index - 1, -1, -1) if has_anchor(entries[k])),
+                window_start,
+            )
+            right = next(
+                (entries[k]["start"] for k in range(run_end + 1, total) if has_anchor(entries[k])),
+                window_end,
+            )
+            left = max(0.0, left)
+            right = max(left, right)
+            window = right - left
+            weights = [float(max(1, len(entries[k]["text"]))) for k in range(index, run_end + 1)]
+            total_weight = sum(weights)
+            if window > 0 and window * (min(weights) / total_weight) < CHUNK_TOKEN_MIN_SPAN_SEC:
+                return None
+            cursor = left
+            for offset, weight in enumerate(weights):
+                if window <= 0:
+                    entries[index + offset]["start"] = cursor
+                    entries[index + offset]["end"] = cursor
+                    continue
+                span = window * weight / total_weight
+                entries[index + offset]["start"] = cursor
+                entries[index + offset]["end"] = cursor + span
+                cursor += span
+            index = run_end + 1
 
+        # 标点不占时间：继承前一个有效 token 的 end。局部重摊后必须重算，
+        # 否则标点仍停在重摊前的旧位置。
         words = []
-        cursor = window_start
-        schedule = iter(zip(valid_indexes, weights))
-        upcoming = next(schedule, None)
-        for index in kept_indexes:
-            if upcoming is not None and index == upcoming[0]:
-                span = window * upcoming[1] / total_weight
-                start = cursor
-                end = min(window_end, cursor + span)
+        cursor = None
+        for position, entry in enumerate(entries):
+            if entry["valid"]:
+                start = max(0.0, entry["start"])
+                end = max(start, entry["end"])
+                words.append({"text": entry["text"], "start": start, "end": end})
                 cursor = end
-                words.append({"text": tokens[index], "start": start, "end": end})
-                upcoming = next(schedule, None)
             else:
-                words.append({"text": tokens[index], "start": cursor, "end": cursor})
-
+                if cursor is None:
+                    # 块首标点：跟块首窗口对齐，但不越过紧随其后的有效 token。
+                    nxt = next(
+                        (entries[k]["start"] for k in range(position + 1, total) if entries[k]["valid"]),
+                        None,
+                    )
+                    cursor = window_start if nxt is None else min(window_start, nxt)
+                words.append({"text": entry["text"], "start": cursor, "end": cursor})
         return words
 
     def _trim_rebuilt_words(self, ground_truth, rebuilt_words, keep_from, lang):
@@ -1612,9 +1718,9 @@ class CloudHotwordAlignPipeline:
             for k, index in enumerate(positions):
                 char_time[index] = (start + step * k, start + step * (k + 1))
 
-        # 第二趟：未锚定字符按「前后夹」摊开。
+        # 第二趟：无词覆盖的字按「前后夹」摊开。
         #
-        # 分组只看**锚点**，不看标点：同一对锚点之间的全部未锚定有效字符共用一个窗口。
+        # 分组只看**锚点**，不看标点：同一对锚点之间的全部无词覆盖有效字共用一个窗口。
         # 若按「连续有效段」分组，标点会把缺口切碎，前一段先把窗口铺到下一个锚点，
         # 后一段就只能从合成值铺到同一点 —— 整段塌成零时长。那正是本次要消灭的形态
         # （2026-10-27 审查反例：`甲乙，丙丁戊` 只锚住「戊」时，丙丁落成 (5.0, 5.0)）。
@@ -1633,7 +1739,7 @@ class CloudHotwordAlignPipeline:
             else:
                 next_starts[i] = next_start
 
-        unanchored = 0
+        uncovered = 0
         groups = []
         for i in range(len(ground_truth)):
             if char_time[i] is not None or not is_valid_char(ground_truth[i]):
@@ -1644,7 +1750,7 @@ class CloudHotwordAlignPipeline:
             groups[-1][1].append(i)
 
         for (prev_end, next_anchor), positions in groups:
-            unanchored += len(positions)
+            uncovered += len(positions)
             if next_anchor is not None:
                 end = next_anchor
             elif chunk_duration is not None:
@@ -1679,7 +1785,7 @@ class CloudHotwordAlignPipeline:
             prev_end = end
 
         stats = {
-            "unanchored": unanchored,
+            "uncovered": uncovered,
             "located_words": located,
             "total_words": len(fa_words),
             "word_spans": word_spans,

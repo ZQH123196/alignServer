@@ -21,6 +21,34 @@ def normalize_multipart_line_endings(text):
 # ==========================================
 # 0. 容器资源获取辅助函数 (已修订探针优先级)
 # ==========================================
+def with_chapter_identity(message, filename):
+    """错误文案首行补章节身份。
+
+    对齐服务只收到音频与参考文本，章节身份的唯一载体是音频文件名
+    （`merged_<书名>_<语言>_<序号>_<章标题>.opus`）。返回里不带上它，
+    调用方看到的就是「某次请求缺了 116 字」，无法定位是哪一章。
+    """
+    name = filename or "(未命名)"
+    return f"章节文件：{name}\n{message}"
+
+
+def audio_defect_error_detail(message, filename, reason):
+    """音频缺陷的 400 裁决体：机器可读 `type` + 章节身份 + 人读诊断。
+
+    调用方只认 `type == "audio_defect"` 时把本章当音频缺陷处理（作废产物 + 重生成音频）。
+    与 `invalid_request_error` 分开是硬约束：两类失败的处置相反，共用一个 type
+    会让音频缺陷被当成参数问题直接失败，回退重跑额度永远用不上。
+    """
+    return {
+        "error": {
+            "message": with_chapter_identity(message, filename),
+            "type": "audio_defect",
+            "reason": reason,
+            "file": filename or "(未命名)",
+        }
+    }
+
+
 def get_container_cpu_count():
     """获取容器实际分配的 CPU 核心数 (优先读取 cgroup 限制，防止 affinity 穿透到宿主机)"""
     cgroup_cores = None

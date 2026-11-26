@@ -113,6 +113,13 @@ class TestCoverageDiagnosis:
         diagnosis = self._diagnosis()
         assert "ASR 转写结尾 160 个有效字（对照用）" in diagnosis
 
+    def test_states_that_the_check_runs_before_chunking(self) -> None:
+        # 2026-10-28 第 34 章：调用方问「不是分块的吗，为什么没兜住」。
+        # 覆盖率判定在切块之前整章比对，分块只约束后续强制对齐窗口。
+        diagnosis = self._diagnosis()
+        assert "切块之前" in diagnosis
+        assert "不吸收整章文本缺失" in diagnosis
+
     def test_empty_asr_is_explained_without_a_fake_missing_count(self) -> None:
         diagnosis = format_coverage_diagnosis(
             {

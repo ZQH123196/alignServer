@@ -111,13 +111,13 @@ uv pip install flash-attn --no-build-isolation
 
 1. **判据只比相对比例。** 参考语速 `R` 与坏块语速 `r` 同单位（有效 token / 秒），判据是比值 `r / R` 落在 `[CHUNK_RATE_BAND_LOW, CHUNK_RATE_BAND_HIGH]` 内。禁止改成绝对 token/秒阈值：绝对值随语言、音色、语速设置一起变，等于给每种语言配一套魔数。
 2. **参考语速来自本次请求内未判坏的块。** `R = Σ(未判坏块的有效 token 数) / Σ(未判坏块的音频时长)`。一次请求 = 一个章节的一种语言，故 `R` 天然带语言与音色，不落盘、不预标定、不跨请求复用。没有未判坏的块时判 `no-good-chunk`，不做任何摊平。
-3. **均分按 token 长度加权。** 权重 = token 字符数。中文逐字切分，每 token 恒为 1，退化为均分；英文按词切分，长词拿到的时长长于短词。每 token 至少 `CHUNK_TOKEN_MIN_SPAN_SEC`。
+3. **修复只重摊缺陷段，权重是 token 长度。** 缺陷段 = 有效且零时长的连续 token（无词覆盖的字已由 `_rebuild_words` 按最近锚点摊过，不再动）。重摊窗口取段前锚点的 end 与段后锚点的 start，块首/块尾段才用 `start_sec` / `end_sec` 兜。健康 token 的观测时间原样保留 —— 整块推平会为 18 个字毁掉同块 62 个可信时间（2026-10-28 第 8 章）。权重 = token 字符数，每 token 至少 `CHUNK_TOKEN_MIN_SPAN_SEC`。
 4. **标点不占时间。** 标点继承前一个有效 token 的 end（块首标点继承块起点）。「有效」用 Unicode 类别判定，不靠 ASCII 白名单：任何脚本的字母与数字都算，符号、标点、空白都不算。
-5. **token 切分只有一处。** `_tokenize_reference` 是唯一实现，rebuild、trim、块诊断、均分四处共用。中文逐字符，其他语言 `\w+|[^\w]`（单词 + 单个标点）。这套切法与客户端 `repairWordTimestamps` 同构，**改一侧必须同批改另一侧**。
+5. **token 切分只有一处。** `_tokenize_reference` 是唯一实现，rebuild、trim、块诊断、修复四处共用。中文逐字符，其他语言 `\w+|[^\w]`（单词 + 单个标点）。这套切法与客户端 `repairWordTimestamps` 同构，**改一侧必须同批改另一侧**。
 
-判坏与修复的常量都在 `cloud_hotword.py` 顶部：`MAX_REPAIRED_CHUNKS_PER_REQUEST`（每请求可均分的块数上限）、`CHUNK_RATE_BAND_LOW/HIGH`（语速比值容差带）、`CHUNK_ZERO_RUN_MIN`（零时长有效 token 的连续段下限，同时用作未锚定有效字符数的阈值）、`CHUNK_COVERAGE_TOLERANCE_SEC`（词流对块窗口的覆盖率容差）、`CHUNK_TOKEN_MIN_SPAN_SEC`（均分后单个 token 的最小跨度）、`CHUNK_ANCHOR_SEARCH_CHARS`（词锚定前跳上限）。阈值只比相对量，禁止改成绝对 token/秒。
+判坏与修复的常量都在 `cloud_hotword.py` 顶部：`MAX_REPAIRED_CHUNKS_PER_REQUEST`（每请求可修复的块数上限）、`CHUNK_RATE_BAND_LOW/HIGH`（语速比值容差带）、`CHUNK_ZERO_RUN_MIN`（零时长有效 token 的连续段下限）、`CHUNK_UNCOVERED_MIN_CHARS`（单块无词覆盖有效字数的下限）、`CHUNK_COVERAGE_TOLERANCE_SEC`（词流对块窗口的覆盖率容差）、`CHUNK_TOKEN_MIN_SPAN_SEC`（重摊后单个 token 的最小跨度）、`CHUNK_ANCHOR_SEARCH_CHARS`（词锚定前跳上限）。阈值只比相对量，禁止改成绝对 token/秒。
 
-均分只用「块内剩余窗口」：起点取前一块已输出的最大 end，终点取下一块首个保留词的起点，上限不超过块窗口。越界会让接缝处时间回退，那是 Fail-Fast 的锚点错位判据。
+`start_sec` / `end_sec`（前一块已输出的最大 end、下一块首个保留词的起点）只兜块首与块尾的缺陷段；块内缺口一律取邻居时间，否则整块会被平移。越界会让接缝处时间回退，那是 Fail-Fast 的锚点错位判据。
 
 ### 词锚定（`_rebuild_words`）
 
@@ -129,11 +129,37 @@ rebuild **不按序号配对**。FA 的输出单位是词，不是字：一串�
 2. 没被任何词覆盖的字符（FA 真丢字）夹在前后两个已锚定字符之间按字数摊；头部贴块起点，尾部贴块终点。
 3. 标点仍继承前一个 token 的 end。
 4. 定位失败时**宁可不锚**：允许前跳 `CHUNK_ANCHOR_SEARCH_CHARS` 个字符，超出即放弃该词。错锚会让整块时间跳变，比留一个缺口危险。
-5. 判据看「未锚定字符数」（`_diagnose_chunk`），**禁止再用「字符数 vs FA 词数」** —— 那会把所有数字块判坏。2026-10-27 事故：三章 54 块里 15 块因此被判 `fa-short`，进而整章作废并回退重跑 tts，而音频本身是对的。
+5. 判据看「无词覆盖的有效字数」（`_diagnose_chunk`），**禁止再用「字符数 vs FA 词数」** —— 那会把所有数字块判坏。2026-10-27 事故：三章 54 块里 15 块因此被判 `fa-short`，进而整章作废并回退重跑 tts，而音频本身是对的。
 
-自证式前提（不是运行时断言）：原文去掉标点与空白，应当等于所有 FA 词文本按顺序拼接。实测 ch8 / ch39 / ch45 三章完全相等，差 0 字。对不上时 `_locate_word` 返回 `None`，该段按缺口处理并在 `未锚字=` 里报数，不静默错位。
+自证式前提（不是运行时断言）：原文去掉标点与空白，应当等于所有 FA 词文本按顺序拼接。实测 ch8 / ch39 / ch45 三章完全相等，差 0 字。对不上时 `_locate_word` 返回 `None`，该段按缺口处理并在 `无词覆盖=` 里报数，不静默错位。
+
+**无词覆盖不等于音频缺字。** 2026-10-28 第 8 章：同一章两次对齐，云端 ASR 覆盖率 98.6% / 98.4%（音频确实念了面板行），而 FA 在该块只给出 68 个词 / 118 字，三块分别有 18、5、15 字没有对上词。差额来自 FA 侧。阈值因此从 5 提到 `CHUNK_UNCOVERED_MIN_CHARS = 10`，与零时长判据的 `CHUNK_ZERO_RUN_MIN = 5` 拆成两个常量。
+
+块被判坏时另打一行 `[块词序]`：FA 词文本、未对位词文本、块原文。判「FA 丢词」还是「锚定拒绝」只看这一行 —— 词表里没有该段的词是模型侧丢词；词在表里却未对位是 `_locate_word` 的边界判定拒绝。
 
 **本地分支未适用词锚定**：`pipeline.py` 的 `_rebuild_words_from_ground_truth` 仍是「有效 token 按序号 1:1 贴 FA 词」，数字串会以完全相同的方式错位。本次只改云分支（`cloud_hotword.py`）。
+
+## 错误响应
+
+除 200 的对齐结果外，本服务只用两种失败形态。调用方按 `detail.error.type` 分派，不读消息文本。
+
+| `type` | HTTP | 含义 | 调用方应有动作 |
+|---|---|---|---|
+| `invalid_request_error` | 400 | 请求参数问题（模型名、语言、缺 `prompt`、缺省校验） | 改请求。原样重发必然同样被拒 |
+| `audio_defect` | 400 | 这份音频与参考文本不符（当前为整章有效字缺失段超过单段容差） | 作废本章产物并重生成音频，不要原样重发 |
+| `alignment_threshold_error` | 400 | 首尾块对齐失败 | 查音频与参考文本。原样重发无意义 |
+| `fa_timestamp_error` | 400 | FA 时间戳校验未通过 | 同上 |
+| `server_error` | 500 | 服务自身故障（含 GPU OOM 耗尽） | 可重试 |
+
+裁决体形状：
+
+```json
+{"detail": {"error": {"message": "…", "type": "audio_defect", "reason": "coverage-gap", "file": "merged_<书名>_<语言>_<序号>_<章标题>.opus"}}}
+```
+
+`message` 首行固定是 `章节文件：<文件名>`。本服务只收到音频与参考文本，章节身份的唯一载体是文件名。不带它，调用方看到的就是「某次请求缺了 116 字」，无法定位是哪一章。
+
+`audio_defect` 与 `invalid_request_error` 共用 400，但处置相反，故必须是两个 type。覆盖率不足发生在切块之前，因此这类响应里没有时间戳。
 
 ## 目录结构
 

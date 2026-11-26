@@ -1,6 +1,6 @@
 import unittest
 
-from utils import normalize_multipart_line_endings
+from utils import normalize_multipart_line_endings, with_chapter_identity, audio_defect_error_detail
 
 
 class NormalizeMultipartLineEndingsTests(unittest.TestCase):
@@ -48,6 +48,39 @@ class NormalizeMultipartLineEndingsTests(unittest.TestCase):
         # Assert: 长度与调用方原文一致，不再多出换行数个字符
         self.assertEqual(len(result), len(text))
         self.assertEqual(result, text)
+
+
+class ChapterErrorBodyTests(unittest.TestCase):
+    """400 裁决体必须带章节身份与机器可读类别（2026-10-28 第 34 章）。
+
+    现场：覆盖率闸门只回了一段诊断，没有章节身份；调用方拿到的是
+    「某次请求中间缺了 116 字」，无法定位是哪一章。且类型与参数错误共用
+    `invalid_request_error`，音频缺陷被当成参数问题直接失败。
+    """
+
+    def test_identity_is_prepended_to_the_message(self) -> None:
+        # Act
+        message = with_chapter_identity("音频与参考文本对不上", "merged_某书_zh-Hans_34_第34章.opus")
+
+        # Assert
+        self.assertTrue(message.startswith("章节文件：merged_某书_zh-Hans_34_第34章.opus\n"))
+
+    def test_missing_filename_does_not_break_the_prefix(self) -> None:
+        # Act
+        message = with_chapter_identity("诊断", None)
+
+        # Assert
+        self.assertTrue(message.startswith("章节文件：(未命名)\n"))
+
+    def test_audio_defect_body_carries_type_reason_and_file(self) -> None:
+        # Act
+        detail = audio_defect_error_detail("中间缺了 116 字", "merged_某书_zh-Hans_34_第34章.opus", "coverage-gap")
+
+        # Assert: 类型是调用方唯一的处置开关，不能与 invalid_request_error 混用
+        self.assertEqual(detail["error"]["type"], "audio_defect")
+        self.assertEqual(detail["error"]["reason"], "coverage-gap")
+        self.assertEqual(detail["error"]["file"], "merged_某书_zh-Hans_34_第34章.opus")
+        self.assertIn("中间缺了 116 字", detail["error"]["message"])
 
 
 if __name__ == "__main__":
