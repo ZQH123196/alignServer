@@ -138,6 +138,29 @@ class HotwordMatchingTests(unittest.TestCase):
         self.assertIn("leading_reference_gap", coverage["reasons"])
         self.assertIn("trailing_reference_gap", coverage["reasons"])
 
+    def test_offender_reports_the_reference_region_and_readable_text(self) -> None:
+        # Arrange: 音频在参考文本 60% 处就结束，缺口全在尾部
+        head = " ".join(f"segment{index:03d}" for index in range(60))
+        tail = " ".join(f"segment{index:03d}" for index in range(60, 100))
+        words = [{"text": f"segment{index:03d}"} for index in range(60)]
+
+        # Act
+        coverage = assess_reference_coverage(
+            f"{head} {tail}",
+            words,
+            "en",
+            normalize,
+            describe=lambda start, end: f"ref[{start}:{end}]",
+        )
+
+        # Assert: 诊断必须能指出"缺的是哪一段"，而不是只给一个长度
+        self.assertEqual(coverage["reasons"], ["trailing_reference_gap"])
+        self.assertEqual(len(coverage["offenders"]), 1)
+        offender = coverage["offenders"][0]
+        self.assertEqual(offender["kind"], "trailing")
+        self.assertEqual(offender["length"], len(normalize(tail, "en")))
+        self.assertTrue(offender["text"].startswith("ref["))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,30 @@
 import os
+import sys
+import time as _time
+
+# stdout 一旦被重定向到管道/文件（nohup、tee），Python 默认块缓冲：日志攒到 8KB 才出现，
+# 启动阶段整体不可见。强制行缓冲让每一行即时落终端。
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+_BOOT_AT = _time.monotonic()
+_BOOT_TOTAL = 6
+_boot_step = 0
+
+
+def boot(msg: str) -> None:
+    """启动期阶段进度。定义在结构化日志与业务模块之前，专门填补导入期的静默窗口。
+
+    带 [k/N] 计数：停在 [k/6] 且不再前进，即卡在标出的那个阶段；6 步跑完后由
+    uvicorn 的 `Uvicorn running on ...` 行确认端口已监听、可接收请求。
+    """
+    global _boot_step
+    _boot_step += 1
+    print(f"[+{_time.monotonic() - _BOOT_AT:5.1f}s] [{_boot_step}/{_BOOT_TOTAL}] {msg}", flush=True)
+
+
+boot("进程已启动 | 正在导入 torch / numpy / fastapi / uvicorn（静默阶段）...")
+
 import json
 import asyncio
 import gc
@@ -8,18 +34,18 @@ import uvicorn
 import tempfile
 import uuid  
 import traceback  
-import sys
-import time as _time
 import threading
-from dotenv import load_dotenv
 
 from fastapi import FastAPI, Form, UploadFile, File, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 
+from env_config import StartupConfigError, load_server_env
 from utils import get_container_cpu_count, get_container_available_memory
 import transformers
 transformers.logging.set_verbosity_error()
+# set_verbosity_error() 连带关掉权重加载进度条，静默只能靠阶段日志兜住。
+boot("依赖导入完成 | 校验启动配置...")
 
 
 # =====================================================================
@@ -216,17 +242,24 @@ def log_fatal(*args, queue: bool = False, **kw) -> None:
     log(*args, level="FATAL", queue=queue, **kw)
 
 
+# 启动即校验环境变量与本地模型目录：配置不完整直接拒绝启动，不留到请求中途炸。
+# 放在业务模块导入之前 —— 校验失败时无需先付 torch/transformers 的导入代价。
+try:
+    SERVER_ENV = load_server_env()
+except StartupConfigError as config_error:
+    log_block(["启动配置检查未通过，服务拒绝启动"] + config_error.problems, level="FATAL")
+    sys.exit(1)
+boot(f"启动配置校验通过 | 目标监听 {SERVER_ENV.host}:{SERVER_ENV.port} | 导入对齐 pipeline（静默阶段）...")
+
 # [修改点 1]：引入我们新定义的 AlignmentThresholdError
 from pipeline import LongAudioAlignPipeline, AlignmentThresholdError, build_sampling_params
 from cloud_hotword import CloudHotwordAlignPipeline, resolve_language as resolve_cloud_language
-
-load_dotenv()
+boot("业务模块导入完成 | 组装 FastAPI 应用")
 
 CONFIG = {
-    "device": "cpu",            
-    "cpu_ratio": 0.7,             
-    "chunk_max_sec": 60,        
-    "vad_padding_sec": 0.3,     
+    "cpu_ratio": 0.7,
+    "chunk_max_sec": 60,
+    "vad_padding_sec": 0.3,
     "min_tail_sec": 30,         # 首尾 chunk 最短时长，过短则向前/后合并，避免残片让 FA 验证失效
     "language": "zh",
 }
@@ -282,7 +315,11 @@ async def lifespan(app: FastAPI):
     global pipeline_instance, cloud_pipeline_instance, gpu_semaphore
     
     log_info("服务初始化中...")
+    log_block(["启动配置"] + SERVER_ENV.describe())
+    boot("正在加载本地模型权重（Silero VAD + Qwen3-ASR + ForcedAligner，静默阶段）...")
+    load_at = _time.time()
     pipeline_instance = LongAudioAlignPipeline(CONFIG)
+    log_info(f"本地模型加载完成 | 耗时 {_time.time() - load_at:.1f}s")
     cloud_pipeline_instance = CloudHotwordAlignPipeline(
         fa_model=pipeline_instance.fa_model,
         fa_lock=pipeline_instance.fa_lock,
@@ -309,9 +346,11 @@ async def lifespan(app: FastAPI):
         dummy_audio = np.random.randn(16000 * 30).astype(np.float32) * 0.01
         dummy_tuple = (dummy_audio, 16000)
         
+        log_info("ASR 预热推理...")
         try: pipeline_instance.asr_model.transcribe(audio=dummy_tuple, language="zh")
         except Exception: pass
             
+        log_info("FA 预热推理...")
         try: pipeline_instance.fa_model.align(audio=dummy_tuple, text="假", language="zh")
         except Exception: pass 
             
@@ -330,9 +369,8 @@ async def lifespan(app: FastAPI):
         ready_device = f"GPU 模式 | {torch.cuda.get_device_name(0)}"
         ready_concurrency = max_concurrency
 
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", 6008))
-    log_info(f"🚀 服务已就绪 | {ready_device} | 并发={ready_concurrency} | 监听 http://{host}:{port}")
+    log_info(f"🚀 模型与并发初始化完成 | {ready_device} | 并发={ready_concurrency} | 即将开始监听 http://{SERVER_ENV.host}:{SERVER_ENV.port}")
+    log_info("下方出现 uvicorn 的 `Uvicorn running on ...` 行即为真正启动完成，可接收请求")
 
     yield 
     log_info("服务正在关闭，清理资源...")
@@ -526,14 +564,24 @@ async def openai_asr_endpoint(
                         await asyncio.sleep(2)
                     else:
                         mark_failed(req_id)
-                        # 对于其他的真正的代码层面的 Bug，依旧保留堆栈打印方便排查
+                        if isinstance(e, ValueError):
+                            # ValueError 一律是业务前置条件不满足（覆盖闸门、热词不足等），
+                            # 属可预期的 400，打堆栈只会让人误判为代码 bug；
+                            # 详细诊断已由抛错处 log_block 过，这里只补一行落点指引。
+                            first_line = str(e).split("\n", 1)[0]
+                            log_error(
+                                f"请求被前置闸门拒绝 | {type(e).__name__}: {first_line}",
+                                req_id=req_id,
+                            )
+                            raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "invalid_request_error"}})
+
+                        # 其他是真正的代码层面 Bug，保留堆栈打印方便排查
                         log_error(
                             "运行时发生未捕获异常（下方为代码堆栈）",
                             req_id=req_id,
                         )
                         traceback.print_exc()
 
-                        if isinstance(e, ValueError): raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "invalid_request_error"}})
                         raise HTTPException(status_code=500, detail={"error": {"message": str(e), "type": "server_error"}})
         finally:
             if tmp_path and os.path.exists(tmp_path):
@@ -543,6 +591,9 @@ async def openai_asr_endpoint(
         unregister(req_id)
 
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", 6008))
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    boot("进入 uvicorn.run | 模型加载完成后，`Uvicorn running on ...` 一行即真正启动")
+    # log_level=info：保留 uvicorn 自己的 startup 行（Waiting for application startup /
+    # Application startup complete / Uvicorn running on）——只有它能在端口 bind 成功后才打印，
+    # 是"服务可接收请求"的唯一权威标记。warning 会把这几行连同启动期一起吞掉，表现为进程无反应。
+    # 请求级日志仍由本文件的结构化日志承担，故关掉 uvicorn 的 access log。
+    uvicorn.run(app, host=SERVER_ENV.host, port=SERVER_ENV.port, log_level="info", access_log=False)

@@ -9,6 +9,7 @@ import threading
 import unicodedata
 
 from qwen_asr import Qwen3ASRModel, Qwen3ForcedAligner
+from env_config import server_env
 from utils import get_container_cpu_count
 from silero_vad import load_silero_vad, get_speech_timestamps
 from fa_timestamp_validation import (
@@ -239,7 +240,8 @@ def build_sampling_params(asr_model, temperature=None, top_p=None, n=None):
 class LongAudioAlignPipeline:
     def __init__(self, config):
         self.config = config
-        self.device = os.environ.get("DEVICE", config.get("device", "cpu"))
+        # DEVICE / 模型路径已在启动期校验完毕，这里只取校验后的结果，不再读环境变量
+        self.device = server_env().device
         
         # 并发模型说明（Qwen3-ASR/FA 实测非线程安全，见 AsrBatchScheduler 文档）：
         #   - VAD: silero-vad 内部维护 LSTM 隐状态 -> vad_lock 串行
@@ -278,8 +280,8 @@ class LongAudioAlignPipeline:
             torch.set_num_threads(1) 
 
         model_kwargs["torch_dtype"] = self.dtype
-        asr_path = os.environ.get("ASR_MODEL_PATH", "Qwen/Qwen3-ASR-0.6B")
-        fa_path = os.environ.get("FA_MODEL_PATH", "Qwen/Qwen3-ForcedAligner-0.6B")
+        asr_path = server_env().asr_model_path
+        fa_path = server_env().fa_model_path
 
         print(f"  设备: {self.device} | ASR: {asr_path} | FA: {fa_path}")
 

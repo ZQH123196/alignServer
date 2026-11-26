@@ -9,7 +9,14 @@ echo "🚀 开始构建 Long Audio Aligner 运行环境..."
 # ==========================================
 echo ""
 export MyWorkDir="/root/autodl-tmp/alignServer"
-export HF_TOKEN="REDACTED_HF_TOKEN"
+# Hugging Face 令牌只从环境读取（运行前 `export HF_TOKEN=hf_xxx`），脚本内禁止留明文。
+# Qwen 公开模型匿名可下，令牌仅用于提升 HF 限额，故缺失时警告不中断。
+export HF_TOKEN="${HF_TOKEN:-}"
+if [ -n "$HF_TOKEN" ]; then
+    echo "✅ 已从环境变量读取 HF_TOKEN（${#HF_TOKEN} 位）"
+else
+    echo "⚠️ 环境变量 HF_TOKEN 未设置：匿名下载可能触发 HF 限流（公开模型可忽略）"
+fi
 export MODEL_ROOT_DIR="/root/autodl-fs/models"
 
 # 创建目录
@@ -185,7 +192,7 @@ if [[ "$use_gpu" == "y" || "$use_gpu" == "Y" ]]; then
         fi
 
         echo "       使用 aria2c (多连接加速)..."
-        aria2c -x 16 -s 16 -k 1M \
+        aria2c -x 8 -s 8 -k 1M \
                --auto-file-renaming=false \
                --console-log-level=warn \
                -o "$FLASH_ATTN_WHL" "$FLASH_ATTN_URL"
@@ -260,6 +267,7 @@ download_model "Qwen/Qwen3-ForcedAligner-0.6B" "$MODEL_ROOT_DIR/Qwen/Qwen3-Force
 # ==========================================
 echo ""
 echo "[*] 正在预先下载并缓存 Silero VAD 模型..."
+uv pip install silero-vad onnxruntime
 # 不再需要 yes y | 管道拦截
 python -c "
 from silero_vad import load_silero_vad
@@ -276,6 +284,10 @@ echo "[*] 开始配置 Web 服务信息 (默认绑定 127.0.0.1:6008)..."
 SERVER_HOST="127.0.0.1"
 SERVER_PORT="6008"
 
+# cloud ASR 分支（qwen-audio-3.0-asr-flash-filetrans）所需；main.py 启动期强校验，缺失即拒绝启动
+read -p "🔑 请输入百炼 API Key (dashscope_apikey，可直接回车沿用环境变量或稍后手工写入 .env): " DASHSCOPE_APIKEY
+DASHSCOPE_APIKEY="${DASHSCOPE_APIKEY:-${dashscope_apikey:-}}"
+
 echo "[*] 正在生成 .env 环境变量配置文件..."
 
 cat <<EOF > .env
@@ -285,6 +297,9 @@ DEVICE=$DEVICE_ENV
 # 本地化模型绝对路径
 ASR_MODEL_PATH=$MODEL_ROOT_DIR/Qwen/Qwen3-ASR-0.6B
 FA_MODEL_PATH=$MODEL_ROOT_DIR/Qwen/Qwen3-ForcedAligner-0.6B
+
+# 百炼 API Key（cloud ASR 分支必需，启动时校验）
+dashscope_apikey=$DASHSCOPE_APIKEY
 
 # FastAPI 服务配置
 HOST=$SERVER_HOST

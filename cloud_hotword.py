@@ -5,6 +5,7 @@ import unicodedata
 import requests
 
 import Levenshtein
+from env_config import server_env
 from fa_timestamp_validation import (
     FaTimestampError,
     validate_absolute_timestamps,
@@ -76,6 +77,12 @@ PARTIAL_MIN_LEN = 5
 FA_MAX_SEC = 270
 TEXT_RATE_BY_LANG = {"zh": 4.5, "en": 12.5}
 TAIL_TEXT_CAPACITY_FACTOR = 1.8
+# 相邻 chunk 以热词为锚点、文本互相重叠，重叠区由前一个 chunk 输出；但紧随重叠区
+# 之后的词（典型为标点）继承的是当前 chunk 自己的 FA 时间戳。同一段文本在两个不同
+# 音频窗口里各对齐一次，FA 边界存在毫秒级抖动，块接缝处可能出现小幅时间回退。
+# 回退在该阈值内视为正常抖动，输出时钳制为单调并 WARN；超过阈值判定为锚点错位或
+# FA 对齐漂移，Fail-Fast 抛错。
+SEAM_JITTER_MAX_SEC = 0.5
 
 CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
 CN_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100000000}
@@ -94,33 +101,37 @@ def _is_punct(ch):
     return cat.startswith("P") or cat.startswith("S")
 
 
-def _cn_number_to_digits(s):
-    def _replace(m):
-        match = m.group(0)
-        if len(match) == 1 and match in CN_DIGIT and match not in CN_UNIT:
-            return match
-        result = 0
-        current = 0
-        wan = 0
-        for ch in match:
-            if ch in CN_DIGIT:
-                current = CN_DIGIT[ch]
-            elif ch in CN_UNIT:
-                u = CN_UNIT[ch]
-                if u == 100000000:
-                    result = (result + (current or 1)) * u
-                    wan = 0
-                    current = 0
-                elif u == 10000:
-                    wan = (result + (current or 1)) * u
-                    result = 0
-                    current = 0
-                else:
-                    result += (current or 1) * u
-                    current = 0
-        return str(wan + result + current)
+def _cn_number_repl(m):
+    match = m.group(0)
+    if len(match) == 1 and match in CN_DIGIT and match not in CN_UNIT:
+        return match
+    result = 0
+    current = 0
+    wan = 0
+    for ch in match:
+        if ch in CN_DIGIT:
+            current = CN_DIGIT[ch]
+        elif ch in CN_UNIT:
+            u = CN_UNIT[ch]
+            if u == 100000000:
+                result = (result + (current or 1)) * u
+                wan = 0
+                current = 0
+            elif u == 10000:
+                wan = (result + (current or 1)) * u
+                result = 0
+                current = 0
+            else:
+                result += (current or 1) * u
+                current = 0
+    return str(wan + result + current)
 
-    return re.sub(r'[零一二三四五六七八九十百千万亿两]+', _replace, s)
+
+CN_NUMBER_RE = re.compile(r'[零一二三四五六七八九十百千万亿两]+')
+
+
+def _cn_number_to_digits(s):
+    return CN_NUMBER_RE.sub(_cn_number_repl, s)
 
 
 def _parse_en_number_words(words):
@@ -141,41 +152,90 @@ def _parse_en_number_words(words):
     return result + current
 
 
-def _en_number_words_to_digits(s):
-    tokens = s.split()
-    out = []
+def _en_number_word_spans(s):
+    """按 token 产出 (文本, 原文起始下标, 是否锚定段首)。
+
+    与 _en_number_words_to_digits 同源：连续数字词归并成一个阿拉伯数字（锚定到该词组首字），
+    其余 token 原样保留，故下标可逐字对齐回原文。
+    """
+    pieces = []
     num_buf = []
+    num_start = 0
 
     def flush():
         if num_buf:
-            out.append(str(_parse_en_number_words(num_buf)))
+            pieces.append((str(_parse_en_number_words(num_buf)), num_start, True))
             num_buf.clear()
 
-    for tok in tokens:
+    for m in re.finditer(r'\S+', s):
+        tok = m.group(0)
         clean = re.sub(r'[^\w]', '', tok).lower()
         ordinal = re.sub(r'(st|nd|rd|th)$', '', clean)
         if clean in EN_ONES or clean in EN_TENS or clean in EN_SCALES:
-            num_buf.append(clean)
+            is_number_word = True
+            word = clean
         elif ordinal != clean and (ordinal in EN_ONES or ordinal in EN_TENS or ordinal in EN_SCALES):
-            num_buf.append(ordinal)
+            is_number_word = True
+            word = ordinal
+        else:
+            is_number_word = False
+
+        if is_number_word:
+            if not num_buf:
+                num_start = m.start()
+            num_buf.append(word)
         else:
             flush()
-            out.append(tok)
+            pieces.append((tok, m.start(), False))
     flush()
-    return " ".join(out)
+    return pieces
+
+
+def _en_number_words_to_digits(s):
+    return " ".join(text for text, _origin, _anchor in _en_number_word_spans(s))
+
+
+def _normalized_segments(s, lang):
+    """把原文切成 (文本段, 原文起始下标, 是否锚定段首)，覆盖 norm_for_match 全部改写规则。
+
+    未改写的段落逐字对齐原文；数字改写段（中文数字/英文数词 → 阿拉伯数字）整段锚定到
+    其在原文中的起点，因此 norm 下标回映射原文不会出现累计漂移。
+    """
+    if lang != "zh":
+        yield from _en_number_word_spans(s)
+        return
+
+    cursor = 0
+    for m in CN_NUMBER_RE.finditer(s):
+        if m.start() > cursor:
+            yield s[cursor:m.start()], cursor, False
+        digits = _cn_number_repl(m)
+        yield digits, m.start(), digits != m.group(0)
+        cursor = m.end()
+    if cursor < len(s):
+        yield s[cursor:], cursor, False
+
+
+def norm_for_match_with_map(s, lang):
+    """norm_for_match 的同源内核，额外产出 norm 下标 -> 原文下标映射。
+
+    禁止另起一套归一化规则：映射与匹配必须逐字同源，否则诊断回显会指错原文。
+    """
+    last = max(len(s) - 1, 0)
+    norm_chars = []
+    idx_map = []
+    for text, origin, anchor_first in _normalized_segments(s, lang):
+        offset = 0
+        for ch in text:
+            if not _is_punct(ch) and not ch.isspace():
+                norm_chars.append(ch.lower())
+                idx_map.append(origin if anchor_first else min(origin + offset, last))
+            offset += 1
+    return "".join(norm_chars), idx_map
 
 
 def norm_for_match(s, lang):
-    if lang == "zh":
-        s = _cn_number_to_digits(s)
-        s = re.sub(r'\s+', '', s)
-        s = "".join(ch for ch in s if not _is_punct(ch))
-        return s.lower()
-    else:
-        s = _en_number_words_to_digits(s)
-        s = "".join(ch for ch in s if not _is_punct(ch))
-        s = re.sub(r'\s+', '', s)
-        return s.lower()
+    return norm_for_match_with_map(s, lang)[0]
 
 
 def _is_contraction_apostrophe(line, i):
@@ -265,15 +325,8 @@ def extract_hotwords(txt_content, lang):
     return selected[:MAX_HOTWORDS]
 
 
-def _get_api_key():
-    key = os.environ.get("dashscope_apikey") or os.environ.get("DASHSCOPE_API_KEY")
-    if not key:
-        raise ValueError("环境变量 dashscope_apikey 未设置，cloud ASR 分支需要百炼 API Key")
-    return key
-
-
 def _upload_oss(local_path, req_id="Unknown"):
-    api_key = _get_api_key()
+    api_key = server_env().dashscope_apikey
     policy_url = f"{DASHSCOPE_BASE}/uploads?action=getPolicy&model={CLOUD_ASR_MODEL}"
     resp = requests.get(policy_url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
     resp.raise_for_status()
@@ -309,7 +362,7 @@ def _upload_oss(local_path, req_id="Unknown"):
 
 
 def _submit_cloud_asr(file_url, lang, vocabulary, req_id="Unknown"):
-    api_key = _get_api_key()
+    api_key = server_env().dashscope_apikey
     body = {
         "model": CLOUD_ASR_MODEL,
         "input": {"file_urls": [file_url]},
@@ -341,7 +394,7 @@ def _submit_cloud_asr(file_url, lang, vocabulary, req_id="Unknown"):
 
 
 def _poll_cloud_asr(task_id, req_id="Unknown", timeout_sec=600):
-    api_key = _get_api_key()
+    api_key = server_env().dashscope_apikey
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         resp = requests.get(
@@ -555,6 +608,93 @@ def _norm_text_to_orig_map(original_text, lang):
     return norm_text, idx_map
 
 
+DIAG_SNIPPET_LIMIT = 160
+# 音频尾部未被转写的时长在此以内，视为 ASR 已走到音频结尾（正常收尾静音）
+COVERAGE_TAIL_SILENCE_MS = 1000
+
+
+def _clip_text(text, limit, from_tail=False):
+    collapsed = re.sub(r'\s+', ' ', text).strip()
+    if len(collapsed) <= limit:
+        return collapsed
+    if from_tail:
+        return "…" + collapsed[-limit:]
+    head = limit // 2
+    return collapsed[:head] + "…" + collapsed[-(limit - head):]
+
+
+def describe_reference_region(reference_text, norm_to_orig, start, end, limit=DIAG_SNIPPET_LIMIT):
+    """归一化下标区间 -> 原文可读片段（须与 norm_for_match_with_map 同源，故下标严格对应）。"""
+    if not norm_to_orig:
+        return ""
+    left = norm_to_orig[min(max(start, 0), len(norm_to_orig) - 1)]
+    right = norm_to_orig[min(max(end - 1, 0), len(norm_to_orig) - 1)] + 1
+    return _clip_text(reference_text[left:right], limit)
+
+
+def coverage_gap_verdict(missing_chars, physical_duration_ms, asr_end_time_ms, lang):
+    """由「缺失字数」与「音频里没被转写的尾时长」推出成因分流判据。
+
+    两者按 TEXT_RATE_BY_LANG 换算后对得上，说明音频时长确实容得下这段文本而 ASR 没转出来
+    （ASR 侧问题）；对不上说明音频本身就没这段内容（上游产物缺料）。
+    """
+    if missing_chars <= 0:
+        return "缺失面为零"
+    uncovered_tail_sec = (physical_duration_ms - asr_end_time_ms) / 1000.0
+    expected_tail_sec = missing_chars / TEXT_RATE_BY_LANG[lang]
+    if uncovered_tail_sec < 0:
+        return (
+            f"ASR 末词时间戳 {-uncovered_tail_sec:.2f}s 超出音频结尾——时间戳与音频本身矛盾，"
+            f"先查 Cloud ASR 返回的 words 时间轴，再谈缺失的 {missing_chars} 字"
+        )
+    if uncovered_tail_sec <= COVERAGE_TAIL_SILENCE_MS / 1000.0:
+        return (
+            f"ASR 末词已走到音频结尾（未转写尾 {uncovered_tail_sec:.2f}s）→ "
+            f"音频本身不含这段文本：查上游 TTS 产物是否缺尾段，不要查 ASR"
+        )
+    if uncovered_tail_sec >= expected_tail_sec * 0.5:
+        return (
+            f"音频尾部有 {uncovered_tail_sec:.2f}s 未被转写，缺失文本按 {TEXT_RATE_BY_LANG[lang]} 字/s "
+            f"约需 {expected_tail_sec:.2f}s → 时长对得上：疑 Cloud ASR 截断/漏转该段，"
+            f"音频可能是完整的"
+        )
+    return (
+        f"音频尾部有 {uncovered_tail_sec:.2f}s 未被转写，但缺失文本只需约 {expected_tail_sec:.2f}s → "
+        f"多出的静音无法解释：参考文本比音频长（多余尾注/未合成内容），查送进来的 prompt"
+    )
+
+
+def format_coverage_diagnosis(
+    coverage, asr_norm_text,
+    physical_duration_ms, asr_end_time_ms, lang,
+):
+    """覆盖闸门的人读诊断，日志与异常共用这一份文本，禁止两处措辞分叉。
+
+    缺失区段的 `text` 已在 coverage 内由调用方的 describe 回调渲染成原文片段。
+    """
+    offenders = coverage.get("offenders", [])
+    missing_chars = sum(item["length"] for item in offenders)
+    lines = [
+        f"refLen={coverage.get('referenceLength', 0)} | asrLen={coverage.get('asrLength', 0)} | "
+        f"matched={coverage.get('matchedLength', 0)} | ratio={coverage.get('coverageRatio', 0):.4f} | "
+        f"leading={coverage.get('leadingGap', 0)} | internal={coverage.get('internalGap', 0)} | "
+        f"trailing={coverage.get('trailingGap', 0)} | allowed={coverage.get('allowedGap', 0)}",
+        f"音频={physical_duration_ms / 1000.0:.2f}s | ASR末词={asr_end_time_ms / 1000.0:.2f}s | "
+        f"缺失合计={missing_chars}字",
+        f"判据: {coverage_gap_verdict(missing_chars, physical_duration_ms, asr_end_time_ms, lang)}",
+    ]
+    for item in offenders:
+        lines.append(
+            f"缺失[{item['kind']}] refNorm[{item['start']}..{item['end']}]（{item['length']}字）: "
+            f"「{item['text']}」"
+        )
+    if asr_norm_text:
+        lines.append(
+            f"ASR 流尾: 「{_clip_text(asr_norm_text, DIAG_SNIPPET_LIMIT, from_tail=True)}」"
+        )
+    return "\n".join(lines)
+
+
 class CloudHotwordAlignPipeline:
     """Cloud ASR (hotword-anchored pathfinding) + local FA alignment pipeline.
 
@@ -582,7 +722,8 @@ class CloudHotwordAlignPipeline:
         if len(hotwords) < 2:
             raise ValueError(
                 f"热词不足 2 个（当前 {len(hotwords)}），无法进行锚点切块。"
-                f"原文可能过短或缺乏唯一子句。"
+                f"语言={run_lang} | 参考文本={len(clean_reference_text)}字 | "
+                f"文本头: 「{_clip_text(clean_reference_text, DIAG_SNIPPET_LIMIT)}」"
             )
 
         vocabulary = {hw["text"]: HOTWORD_WEIGHT for hw in hotwords}
@@ -595,36 +736,18 @@ class CloudHotwordAlignPipeline:
         asr_text = _transcript_text(transcription)
         asr_end_time_ms = words[-1].get("end_time", 0) if words else 0
 
-        coverage = assess_reference_coverage(
-            clean_reference_text,
-            words,
-            run_lang,
-            norm_for_match,
-        )
-        log_info(
-            f"ASR 文本覆盖 | ratio={coverage.get('coverageRatio', 0):.4f} | "
-            f"leading={coverage.get('leadingGap', 0)} | "
-            f"internal={coverage.get('internalGap', 0)} | "
-            f"trailing={coverage.get('trailingGap', 0)} | "
-            f"allowed={coverage.get('allowedGap', 0)}",
-            req_id=req_id,
-        )
-        if not coverage["ok"]:
-            reasons = ", ".join(coverage["reasons"])
-            raise ValueError(
-                f"音频与参考文本覆盖不一致: {reasons} | "
-                f"leading={coverage.get('leadingGap', 0)} | "
-                f"internal={coverage.get('internalGap', 0)} | "
-                f"trailing={coverage.get('trailingGap', 0)} | "
-                f"allowed={coverage.get('allowedGap', 0)}"
-            )
-
+        # 音频时长必须在覆盖闸门之前算：它是区分「音频缺料」与「ASR 漏转」的唯一判据，
+        # 写在 raise 之后等于失败时永远拿不到。
         import soundfile as sf
         import torch
         try:
             audio_data, sample_rate = sf.read(audio_path)
         except Exception as err:
-            log_error(f"阶段: 音频读取失败 | 详情: {err}", req_id=req_id)
+            log_error(
+                f"阶段: 音频读取失败 | 文件={audio_path} | "
+                f"大小={os.path.getsize(audio_path)}B | 详情: {err}",
+                req_id=req_id,
+            )
             raise
 
         wav = torch.from_numpy(audio_data).float()
@@ -652,7 +775,39 @@ class CloudHotwordAlignPipeline:
             req_id=req_id,
         )
 
-        full_norm = norm_for_match(clean_reference_text, run_lang)
+        # 变量名与 FA 路径的 ref_idx_map（含繁简转换，另一套归一化）刻意分开：两者下标空间不同
+        reference_norm, diag_idx_map = norm_for_match_with_map(clean_reference_text, run_lang)
+        asr_norm, _ = build_asr_stream(words, run_lang, norm_for_match)
+        coverage = assess_reference_coverage(
+            clean_reference_text,
+            words,
+            run_lang,
+            norm_for_match,
+            describe=lambda start, end: describe_reference_region(
+                clean_reference_text, diag_idx_map, start, end
+            ),
+        )
+        coverage_diagnosis = format_coverage_diagnosis(
+            coverage, asr_norm, physical_duration_ms, asr_end_time_ms, run_lang,
+        )
+        if not coverage["ok"]:
+            log_block(
+                ["━━━ ASR 文本覆盖不足 ━━━"] + coverage_diagnosis.split("\n"),
+                req_id=req_id, level="ERROR",
+            )
+            raise ValueError(
+                f"音频与参考文本覆盖不一致: {', '.join(coverage['reasons'])}\n"
+                f"{coverage_diagnosis}\n"
+                f"参考文本尾: 「{_clip_text(clean_reference_text, DIAG_SNIPPET_LIMIT, from_tail=True)}」"
+            )
+
+        log_info(
+            f"ASR 文本覆盖 OK | ratio={coverage['coverageRatio']:.4f} | "
+            f"internal={coverage['internalGap']} | allowed={coverage['allowedGap']}",
+            req_id=req_id,
+        )
+
+        full_norm = reference_norm
         matched, partial_matched, unmatched, duplicate_in_asr = _match_hotwords(
             hotwords, words, run_lang
         )
@@ -748,6 +903,9 @@ class CloudHotwordAlignPipeline:
         all_word_alignments = []
         fa_diag = []
         emitted_orig_end = 0
+        word_origins = []
+        last_emitted = None
+        seam_clamp_count = 0
 
         for chunk in chunks:
             text_start_norm = chunk["textStart"]
@@ -781,6 +939,7 @@ class CloudHotwordAlignPipeline:
                 )
                 audio_end_sec = audio_start_sec + FA_MAX_SEC
                 chunk_dur = FA_MAX_SEC
+            chunk_origin = f"chunk[{chunk['index']}] {audio_start_sec:.3f}..{audio_end_sec:.3f}s"
 
             start_sample = max(0, int(audio_start_sec * sample_rate))
             end_sample = min(len(wav), int(audio_end_sec * sample_rate))
@@ -823,11 +982,20 @@ class CloudHotwordAlignPipeline:
                 ground_truth, rebuilt_words, keep_from, run_lang
             )
             for w in kept_words:
+                start = round(audio_start_sec + w["start"], 3)
+                end = round(audio_start_sec + w["end"], 3)
+                start, end, clamped = self._enforce_seam_monotonicity(
+                    w["text"], start, end, chunk_origin, last_emitted, req_id
+                )
+                if clamped:
+                    seam_clamp_count += 1
                 verbose_json["words"].append({
                     "word": w["text"],
-                    "start": round(audio_start_sec + w["start"], 3),
-                    "end": round(audio_start_sec + w["end"], 3),
+                    "start": start,
+                    "end": end,
                 })
+                word_origins.append(chunk_origin)
+                last_emitted = (start, end, w["text"], chunk_origin)
             fa_text_parts.extend(w.text for w in fa_res[fa_start:])
             emitted_orig_end = max(emitted_orig_end, orig_end)
 
@@ -839,7 +1007,14 @@ class CloudHotwordAlignPipeline:
         uses_character_tokens = run_lang == "zh"
         verbose_json["text"] = "".join(fa_text_parts) if uses_character_tokens else " ".join(fa_text_parts)
 
-        self._validate_subtitle_timestamps(verbose_json["words"], req_id=req_id)
+        if seam_clamp_count:
+            log_warn(
+                f"块接缝钳制汇总 | 共 {seam_clamp_count} 个词条时间戳被钳制为单调（详见上方逐条 WARN）",
+                req_id=req_id,
+            )
+        self._validate_subtitle_timestamps(
+            verbose_json["words"], origins=word_origins, req_id=req_id
+        )
 
         norm_result = norm_for_match(verbose_json["text"], run_lang)
         ratio = Levenshtein.ratio(full_norm, norm_result)
@@ -873,9 +1048,45 @@ class CloudHotwordAlignPipeline:
             log_error(message, req_id=req_id)
             raise
 
-    def _validate_subtitle_timestamps(self, words, req_id="Unknown"):
+    def _enforce_seam_monotonicity(self, word_text, start, end, origin, last_emitted, req_id):
+        """强制跨 chunk 输出单调，吸收块接缝处的 FA 时间戳抖动。
+
+        重叠文本在相邻两个 chunk 里各对齐一次：重叠区本身由前一个 chunk 输出，
+        但紧随重叠区之后的词（典型为标点，继承当前块 FA 的前词 end）来自当前 chunk
+        的对齐，两者存在毫秒级差异，接缝处可能出现小幅时间回退。
+        回退 <= SEAM_JITTER_MAX_SEC 视为正常抖动，钳制到前项边界并 WARN；
+        超过阈值判定为锚点错位/FA 漂移，Fail-Fast 抛错。
+        返回 (start, end, clamped)。
+        """
+        if last_emitted is None:
+            return start, end, False
+        p_start, p_end, p_word, p_origin = last_emitted
+        regression = max(p_start - start, p_end - end)
+        if regression <= 0:
+            return start, end, False
+        if regression > SEAM_JITTER_MAX_SEC:
+            message = (
+                f"❌ 跨 chunk 接缝时间戳回退超容差 | 回退={regression:.3f}s "
+                f"(容差={SEAM_JITTER_MAX_SEC}s) | "
+                f"前项'{p_word}' {p_start:.3f}..{p_end:.3f}s 来源={p_origin} | "
+                f"当前'{word_text}' {start:.3f}..{end:.3f}s 来源={origin} | "
+                f"可能原因: 热词锚点(beginTime/endTime)错位或该段 FA 对齐漂移"
+            )
+            log_error(message, req_id=req_id)
+            raise FaTimestampError(message)
+        new_start = max(start, p_start)
+        new_end = max(end, p_end)
+        log_warn(
+            f"块接缝时间戳抖动钳制 | 回退={regression:.3f}s | "
+            f"'{word_text}' {start:.3f}..{end:.3f}s -> {new_start:.3f}..{new_end:.3f}s | "
+            f"前项'{p_word}' 来源={p_origin} | 当前来源={origin}",
+            req_id=req_id,
+        )
+        return new_start, new_end, True
+
+    def _validate_subtitle_timestamps(self, words, origins=None, req_id="Unknown"):
         try:
-            validate_absolute_timestamps(words)
+            validate_absolute_timestamps(words, origins=origins)
         except FaTimestampError as err:
             log_error(f"❌ {err}", req_id=req_id)
             raise

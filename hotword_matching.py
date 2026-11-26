@@ -21,6 +21,9 @@ def build_asr_stream(
     return "".join(stream_parts), char_to_word
 
 
+DescribeRegion = Callable[[int, int], str]
+
+
 def assess_reference_coverage(
     reference_text: str,
     words: list[dict[str, Any]],
@@ -29,8 +32,13 @@ def assess_reference_coverage(
     *,
     max_gap_ratio: float = 0.01,
     minimum_gap: int = 32,
+    describe: DescribeRegion | None = None,
 ) -> dict[str, Any]:
-    """Detect large reference-text regions absent from the ASR word stream."""
+    """Detect large reference-text regions absent from the ASR word stream.
+
+    ``describe`` maps a normalized reference region back to human-readable text
+    so callers can report *which* reference content is missing, not just how much.
+    """
     reference_stream = normalize(reference_text, language)
     asr_stream, _ = build_asr_stream(words, language, normalize)
     allowed_gap = max(minimum_gap, int(len(reference_stream) * max_gap_ratio))
@@ -38,6 +46,7 @@ def assess_reference_coverage(
         return {
             "ok": False,
             "reasons": ["empty_reference"],
+            "offenders": [],
             "referenceLength": 0,
             "asrLength": len(asr_stream),
             "matchedLength": 0,
@@ -51,6 +60,7 @@ def assess_reference_coverage(
         return {
             "ok": False,
             "reasons": ["empty_asr"],
+            "offenders": [],
             "referenceLength": len(reference_stream),
             "asrLength": 0,
             "matchedLength": 0,
@@ -69,41 +79,56 @@ def assess_reference_coverage(
         if block.size > 0
     ]
     matched_length = sum(block.size for block in blocks)
+    ref_len = len(reference_stream)
     gaps: list[tuple[int, int, int]] = (
-        [(0, len(reference_stream), len(reference_stream))] if not blocks else []
+        [(0, ref_len, ref_len)] if not blocks else []
     )
     reference_cursor = 0
     for block in blocks:
         if block.a > reference_cursor:
             gaps.append((reference_cursor, block.a, block.a - reference_cursor))
         reference_cursor = block.a + block.size
-    if reference_cursor < len(reference_stream):
-        gaps.append((reference_cursor, len(reference_stream), len(reference_stream) - reference_cursor))
+    if reference_cursor < ref_len:
+        gaps.append((reference_cursor, ref_len, ref_len - reference_cursor))
 
-    leading_gap = gaps[0][2] if gaps and gaps[0][0] == 0 else 0
-    trailing_gap = gaps[-1][2] if gaps and gaps[-1][1] == len(reference_stream) else 0
+    empty_gap = (0, 0, 0)
+    leading_gap = gaps[0] if gaps and gaps[0][0] == 0 else empty_gap
+    trailing_gap = gaps[-1] if gaps and gaps[-1][1] == ref_len else empty_gap
     internal_gap = max(
-        (gap[2] for gap in gaps if gap[0] > 0 and gap[1] < len(reference_stream)),
-        default=0,
+        (gap for gap in gaps if gap[0] > 0 and gap[1] < ref_len),
+        key=lambda gap: gap[2],
+        default=empty_gap,
     )
+
     reasons: list[str] = []
-    if leading_gap > allowed_gap:
-        reasons.append("leading_reference_gap")
-    if internal_gap > allowed_gap:
-        reasons.append("internal_reference_gap")
-    if trailing_gap > allowed_gap:
-        reasons.append("trailing_reference_gap")
+    offenders: list[dict[str, Any]] = []
+    seen_regions: set[tuple[int, int]] = set()
+    for kind, gap in (("leading", leading_gap), ("internal", internal_gap), ("trailing", trailing_gap)):
+        if gap[2] <= allowed_gap:
+            continue
+        reasons.append(f"{kind}_reference_gap")
+        if gap[:2] in seen_regions:
+            continue
+        seen_regions.add(gap[:2])
+        offenders.append({
+            "kind": kind,
+            "start": gap[0],
+            "end": gap[1],
+            "length": gap[2],
+            "text": describe(gap[0], gap[1]) if describe else reference_stream[gap[0]:gap[1]],
+        })
 
     return {
         "ok": not reasons,
         "reasons": reasons,
-        "referenceLength": len(reference_stream),
+        "offenders": offenders,
+        "referenceLength": ref_len,
         "asrLength": len(asr_stream),
         "matchedLength": matched_length,
-        "coverageRatio": matched_length / len(reference_stream),
-        "leadingGap": leading_gap,
-        "internalGap": internal_gap,
-        "trailingGap": trailing_gap,
+        "coverageRatio": matched_length / ref_len,
+        "leadingGap": leading_gap[2],
+        "internalGap": internal_gap[2],
+        "trailingGap": trailing_gap[2],
         "allowedGap": allowed_gap,
     }
 
