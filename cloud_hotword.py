@@ -10,6 +10,13 @@ from fa_timestamp_validation import (
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
 )
+from hotword_matching import (
+    assess_reference_coverage,
+    build_asr_stream,
+    find_best_span,
+    find_tail_matches,
+    select_monotonic_chain,
+)
 
 try:
     import zhconv
@@ -388,48 +395,18 @@ def _transcript_text(transcription):
     return ""
 
 
-def _longest_common_substring(a, b):
-    best = ""
-    best_b = 0
-    m, n = len(a), len(b)
-    if m == 0 or n == 0:
-        return "", 0
-    prev = [0] * (n + 1)
-    for i in range(1, m + 1):
-        curr = [0] * (n + 1)
-        for j in range(1, n + 1):
-            if a[i - 1] == b[j - 1]:
-                curr[j] = prev[j - 1] + 1
-                if curr[j] > len(best):
-                    best = a[i - curr[j]:i]
-                    best_b = j - curr[j]
-        prev = curr
-    return best, best_b
-
-
-def _build_asr_stream(words, lang):
-    char_to_word = []
-    stream = ""
-    for wi, w in enumerate(words):
-        raw = f"{w.get('text', '')}{w.get('punctuation', '')}"
-        token = norm_for_match(raw, lang)
-        for _ in token:
-            char_to_word.append(wi)
-        stream += token
-    return stream, char_to_word
-
-
-def _match_hotwords(hotwords, words, lang, full_norm):
-    stream, char_to_word = _build_asr_stream(words, lang)
+def _match_hotwords(hotwords, words, lang):
+    stream, char_to_word = build_asr_stream(words, lang, norm_for_match)
 
     matched = []
     partial_matched = []
     unmatched = []
     duplicate_in_asr = []
+    search_cursor = 0
 
     for hw in hotwords:
         norm = hw["normText"]
-        first_idx = stream.find(norm)
+        first_idx = stream.find(norm, search_cursor)
         if first_idx >= 0:
             second_idx = stream.find(norm, first_idx + 1)
             if second_idx >= 0:
@@ -439,37 +416,69 @@ def _match_hotwords(hotwords, words, lang, full_norm):
             end_word_idx = char_to_word[first_idx + len(norm) - 1]
             begin_time = words[start_word_idx].get("begin_time", 0)
             end_time = words[end_word_idx].get("end_time", 0)
-            matched.append({**hw, "asrOffset": first_idx, "beginTime": begin_time, "endTime": end_time})
+            matched.append({
+                **hw,
+                "asrOffset": first_idx,
+                "asrEndOffset": first_idx + len(norm),
+                "beginTime": begin_time,
+                "endTime": end_time,
+                "matchScore": 1.0,
+                "matchType": "exact",
+            })
+            search_cursor = first_idx + len(norm)
             continue
 
-        sub, index_b = _longest_common_substring(norm, stream)
-        ratio = len(sub) / len(norm) if norm else 0
-        if len(sub) >= PARTIAL_MIN_LEN and ratio >= PARTIAL_MATCH_RATIO:
-            asr_unique = stream.find(sub, index_b + 1) < 0
-            orig_unique = full_norm.count(sub) == 1
-            if asr_unique and orig_unique:
-                start_word_idx = char_to_word[index_b]
-                end_word_idx = char_to_word[index_b + len(sub) - 1]
-                begin_time = words[start_word_idx].get("begin_time", 0)
-                end_time = words[end_word_idx].get("end_time", 0)
-                partial_matched.append({**hw, "asrOffset": index_b, "beginTime": begin_time, "endTime": end_time})
-                continue
+        span = find_best_span(
+            norm,
+            stream,
+            start=search_cursor,
+            min_ratio=PARTIAL_MATCH_RATIO,
+            min_length=PARTIAL_MIN_LEN,
+        )
+        if span is not None:
+            start = span["start"]
+            end = span["end"]
+            start_word_idx = char_to_word[start]
+            end_word_idx = char_to_word[min(end - 1, len(char_to_word) - 1)]
+            begin_time = words[start_word_idx].get("begin_time", 0)
+            end_time = words[end_word_idx].get("end_time", 0)
+            partial_matched.append({
+                **hw,
+                "asrOffset": start,
+                "asrEndOffset": end,
+                "beginTime": begin_time,
+                "endTime": end_time,
+                "matchScore": span["score"],
+                "matchType": "fuzzy",
+            })
+            search_cursor = end
+            continue
 
         unmatched.append(hw)
 
     return matched, partial_matched, unmatched, duplicate_in_asr
 
 
-def _enforce_monotonicity(matched):
-    sorted_hw = sorted(matched, key=lambda h: h["beginTime"])
-    valid = []
-    discarded = []
-    for hw in sorted_hw:
-        if not valid or hw["offsetInFullNorm"] > valid[-1]["offsetInFullNorm"]:
-            valid.append(hw)
-        else:
-            discarded.append(hw)
-    return valid, discarded
+def _match_tail_hotwords(hotwords, words, lang, existing_matches):
+    candidates = find_tail_matches(
+        hotwords,
+        words,
+        lang,
+        norm_for_match,
+        existing_matches,
+        min_ratio=PARTIAL_MATCH_RATIO,
+        min_length=PARTIAL_MIN_LEN,
+    )
+    matched = []
+    for candidate in candidates:
+        start_word_idx = candidate["startWordIndex"]
+        end_word_idx = candidate["endWordIndex"]
+        matched.append({
+            **candidate,
+            "beginTime": words[start_word_idx].get("begin_time", 0),
+            "endTime": words[end_word_idx].get("end_time", 0),
+        })
+    return matched
 
 
 def _build_chunks(valid_hotwords, full_norm_len, total_duration_ms):
@@ -586,6 +595,30 @@ class CloudHotwordAlignPipeline:
         asr_text = _transcript_text(transcription)
         asr_end_time_ms = words[-1].get("end_time", 0) if words else 0
 
+        coverage = assess_reference_coverage(
+            clean_reference_text,
+            words,
+            run_lang,
+            norm_for_match,
+        )
+        log_info(
+            f"ASR 文本覆盖 | ratio={coverage.get('coverageRatio', 0):.4f} | "
+            f"leading={coverage.get('leadingGap', 0)} | "
+            f"internal={coverage.get('internalGap', 0)} | "
+            f"trailing={coverage.get('trailingGap', 0)} | "
+            f"allowed={coverage.get('allowedGap', 0)}",
+            req_id=req_id,
+        )
+        if not coverage["ok"]:
+            reasons = ", ".join(coverage["reasons"])
+            raise ValueError(
+                f"音频与参考文本覆盖不一致: {reasons} | "
+                f"leading={coverage.get('leadingGap', 0)} | "
+                f"internal={coverage.get('internalGap', 0)} | "
+                f"trailing={coverage.get('trailingGap', 0)} | "
+                f"allowed={coverage.get('allowedGap', 0)}"
+            )
+
         import soundfile as sf
         import torch
         try:
@@ -621,9 +654,17 @@ class CloudHotwordAlignPipeline:
 
         full_norm = norm_for_match(clean_reference_text, run_lang)
         matched, partial_matched, unmatched, duplicate_in_asr = _match_hotwords(
-            hotwords, words, run_lang, full_norm
+            hotwords, words, run_lang
         )
         all_matched = matched + partial_matched
+        tail_matched = _match_tail_hotwords(unmatched, words, run_lang, all_matched)
+        if tail_matched:
+            partial_matched.extend(tail_matched)
+            all_matched.extend(tail_matched)
+            matched_norms = {item["normText"] for item in tail_matched}
+            unmatched = [
+                item for item in unmatched if item["normText"] not in matched_norms
+            ]
 
         log_block([
             "━━━ 热词匹配诊断 ━━━",
@@ -636,7 +677,7 @@ class CloudHotwordAlignPipeline:
         ] if unmatched else []),
             req_id=req_id, level="INFO")
 
-        valid, discarded = _enforce_monotonicity(all_matched)
+        valid, discarded = select_monotonic_chain(all_matched, "beginTime")
         if discarded:
             log_warn(f"单调性丢弃: {len(discarded)} 个热词", req_id=req_id)
 

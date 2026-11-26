@@ -13,6 +13,7 @@ dependencies = [
     "psutil>=5.0.0",             # 动态内存监控与探针
     "transformers>=4.40.0",      # Qwen 模型基础依赖
     "accelerate>=0.30.0",        # 模型设备映射与加速
+    "qwen-asr @ https://github.com/QwenLM/Qwen3-ASR/archive/refs/heads/main.zip",
     "silero-vad>=5.1.0",         # [新增] 改用 pip 托管官方 VAD 库
     # Web 服务与 UI 依赖
     "fastapi>=0.100.0",          
@@ -35,3 +36,13 @@ ms = ["modelscope"]              # 国内 ModelScope
 
 [tool.uv]
 package = false
+override-dependencies = ["numba>=0.60.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
