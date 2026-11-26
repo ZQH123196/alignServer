@@ -14,6 +14,7 @@ from utils import get_container_cpu_count
 from silero_vad import load_silero_vad, get_speech_timestamps
 from fa_timestamp_validation import (
     FaTimestampError,
+    normalize_fa_interval_overlaps,
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
 )
@@ -1946,7 +1947,19 @@ class LongAudioAlignPipeline:
                 self._assert_fa_timestamps_in_chunk(
                     single_fa_res, chunk_start, chunk_info['end'], req_id,
                 )
-                rebuilt_words = self._rebuild_words_from_ground_truth(ground_truth, single_fa_res, run_lang)
+                # 压平只在本函数内生效：调用方持有的 single_fa_res 仍是 FA 原始输出，
+                # all_word_alignments 收的就是原始输出，与 aligned_chunks 分支口径一致。
+                disjoint_fa_res, fa_clamped, fa_max_overlap = normalize_fa_interval_overlaps(
+                    single_fa_res, chunk_start, chunk_info['end']
+                )
+                if fa_clamped:
+                    log_warn(
+                        f"FA 区间重叠压平 | chunk[{chunk_start:.3f}..{chunk_info['end']:.3f}s] | "
+                        f"压平 {fa_clamped} 个词条 | 最大压平 {fa_max_overlap * 1000:.0f}ms | "
+                        f"逐词估边共享时间是正常现象，压平后标点补位才落在后词起点之前",
+                        req_id=req_id,
+                    )
+                rebuilt_words = self._rebuild_words_from_ground_truth(ground_truth, disjoint_fa_res, run_lang)
                 for w in rebuilt_words:
                     verbose_json["words"].append({
                         "word": w["text"],
@@ -2263,9 +2276,20 @@ class LongAudioAlignPipeline:
                 chunk_info["end"],
                 req_id,
             )
+            # rebuild 用压平后的一份；健康度评分仍用 FA 原始输出，评的是模型本身。
+            disjoint_fa_res, fa_clamped, fa_max_overlap = normalize_fa_interval_overlaps(
+                fa_res, chunk_info["start"], chunk_info["end"]
+            )
+            if fa_clamped:
+                log_warn(
+                    f"FA 区间重叠压平 | chunk[{chunk_info['start']:.3f}..{chunk_info['end']:.3f}s] | "
+                    f"压平 {fa_clamped} 个词条 | 最大压平 {fa_max_overlap * 1000:.0f}ms | "
+                    f"逐词估边共享时间是正常现象，压平后标点补位才落在后词起点之前",
+                    req_id=req_id,
+                )
             rebuilt_words = self._rebuild_words_from_ground_truth(
                 ground_truth,
-                fa_res,
+                disjoint_fa_res,
                 run_lang,
             )
             for word in rebuilt_words:

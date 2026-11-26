@@ -25,6 +25,15 @@ def boot(msg: str) -> None:
 
 boot("进程已启动 | 正在导入 torch / numpy / fastapi / uvicorn（静默阶段）...")
 
+# libgomp（torch 自带的 OpenMP 运行库）在 .so 被 dlopen 时读一次 OMP_NUM_THREADS，
+# 要求正整数。系统镜像注入的 0 是无效值，libgomp 报错并回退到宿主机核数。
+# 系统文件不能改，在 import torch 之前覆盖成容器配额。
+# pipeline 内还会用 torch.set_num_threads 按 cpu_ratio 再收紧，这里只定上限。
+from utils import get_container_cpu_count
+
+os.environ["OMP_NUM_THREADS"] = str(get_container_cpu_count())
+os.environ["MKL_NUM_THREADS"] = str(get_container_cpu_count())
+
 import json
 import asyncio
 import gc
@@ -46,7 +55,7 @@ from env_config import (
     check_lockfile,
     load_server_env,
 )
-from utils import get_container_cpu_count, get_container_available_memory
+from utils import get_container_available_memory, normalize_multipart_line_endings
 import transformers
 transformers.logging.set_verbosity_error()
 # set_verbosity_error() 连带关掉权重加载进度条，静默只能靠阶段日志兜住。
@@ -404,6 +413,10 @@ async def openai_asr_endpoint(
     global active_gpu_requests
     
     req_id = str(uuid.uuid4())[:8]
+    # multipart 的字段值会被调用方（Node FormData 实测如此）编码成 CRLF。参考文本是
+    # 「调用方原文的逐字副本」，必须在入口还原成 LF，否则每行多一个字符，词级时间戳
+    # 与 chunk 下标都会与调用方持有的原文错位。
+    prompt = normalize_multipart_line_endings(prompt)
     is_alignment_mode = (model in VALID_ALIGNMENT_MODELS)
     is_fa_only_mode = (model in VALID_FA_ONLY_MODELS)
     is_cloud_hotword_mode = (model in VALID_CLOUD_HOTWORD_MODELS)
@@ -551,7 +564,7 @@ async def openai_asr_endpoint(
                     # 运行期 FA 对齐失败（时间戳校验未通过）：不是请求参数问题，
                     # 但同一输入确定性复现，重试无意义，故返回 400 并给专属 type。
                     # 与 AlignmentThresholdError 同处置，不再走通用 ValueError 分支
-                    # 被误标成「前置闸门」。
+                    # 被误标成「前置校验」。
                     mark_failed(req_id)
                     first_line = str(e).split("\n", 1)[0]
                     log_error(
@@ -591,12 +604,12 @@ async def openai_asr_endpoint(
                     else:
                         mark_failed(req_id)
                         if isinstance(e, ValueError):
-                            # ValueError 一律是业务前置条件不满足（覆盖闸门、热词不足等），
+                            # ValueError 一律是业务前置条件不满足（覆盖率校验、热词不足等），
                             # 属可预期的 400，打堆栈只会让人误判为代码 bug；
                             # 详细诊断已由抛错处 log_block 过，这里只补一行落点指引。
                             first_line = str(e).split("\n", 1)[0]
                             log_error(
-                                f"请求被前置闸门拒绝 | {type(e).__name__}: {first_line}",
+                                f"请求被前置校验拒绝 | {type(e).__name__}: {first_line}",
                                 req_id=req_id,
                             )
                             raise HTTPException(status_code=400, detail={"error": {"message": str(e), "type": "invalid_request_error"}})

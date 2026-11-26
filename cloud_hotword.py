@@ -9,6 +9,8 @@ from env_config import server_env
 from fa_timestamp_validation import (
     FA_BOUNDARY_JITTER_SEC,
     FaTimestampError,
+    clamp_seam_interval,
+    normalize_fa_interval_overlaps,
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
 )
@@ -78,16 +80,27 @@ PARTIAL_MIN_LEN = 5
 FA_MAX_SEC = 270
 TEXT_RATE_BY_LANG = {"zh": 4.5, "en": 12.5}
 TAIL_TEXT_CAPACITY_FACTOR = 1.8
-# 相邻 chunk 以热词为锚点、文本互相重叠，重叠区由前一个 chunk 输出；但紧随重叠区
-# 之后的词（典型为标点）继承的是当前 chunk 自己的 FA 时间戳。同一段文本在两个不同
-# 音频窗口里各对齐一次，FA 边界存在毫秒级抖动，块接缝处可能出现小幅时间回退。
-# 回退在该阈值内视为正常抖动，输出时钳制为单调并 WARN；超过阈值判定为锚点错位或
-# FA 对齐漂移，Fail-Fast 抛错。
+# 接缝抖动容差（秒）。**只属于热词锚点分块这一条链路**，不是全仓通用规则。
+#
+# 为什么只有它有：相邻 chunk 的文本按热词锚点互相重叠，同一段文本会在两个音频窗口
+# 里各对齐一次；重叠区由前一个 chunk 输出，紧随其后的词（典型为标点）继承当前 chunk
+# 自己的 FA 时间戳。同一个边界的两次估边存在毫秒级差异，块接缝处就会出现时间回退。
+#
+# 判据是**区间**：后一个词的 start 不得早于此前所有已输出词的 end。只比前一项的
+# start/end 会让「标点 end 被抬高、后一个实词起点仍在它之前」漏过去（见
+# `_enforce_seam_monotonicity` 的说明）。回退在该阈值内视为正常抖动，钳制并 WARN；
+# 超过阈值判定为锚点错位或 FA 对齐漂移，Fail-Fast 抛错。
+#
+# 另外两条链路（pipeline 的本地 ASR+FA、纯 FA）按 IPA 游标切文本，每段只对齐一次，
+# 不存在同一段文本的两次估边，因此不套本阈值，只在末尾做点态单调校验。
+# **两条链路的接缝行为不同是有意为之**：压平的前提是重叠来自「同一段文本被对齐两次」，
+# 不是把任何接缝偏差都吸收掉。本仓投产的只有热词这一条；将来若要启用那两条，
+# 先决定用哪条不变式，再谈共用。
 SEAM_JITTER_MAX_SEC = FA_BOUNDARY_JITTER_SEC
 
 # chunk 音频窗口两端各留余量，让 FA 的文本有落点，消除「末端差 0.2s」这类纯
 # 边界抖动（ASR 锚点 vs FA 边界）。真伪对齐（文本远超音频）余量盖不住，仍会
-# 被窗口容差/覆盖闸门抓住。与接缝容差同源，避免同一种物理量出现两把标尺。
+# 被窗口容差/覆盖率校验抓住。与接缝容差同源，避免同一种物理量出现两把标尺。
 FA_CHUNK_PAD_SEC = FA_BOUNDARY_JITTER_SEC
 
 CN_DIGIT = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "两": 2}
@@ -685,7 +698,7 @@ def format_coverage_diagnosis(
     coverage, asr_norm_text,
     physical_duration_ms, asr_end_time_ms, lang,
 ):
-    """覆盖闸门的人读诊断，日志与异常共用这一份文本，禁止两处措辞分叉。
+    """覆盖率校验的人读诊断，日志与异常共用这一份文本，禁止两处措辞分叉。
 
     缺失区段的 `text` 已在 coverage 内由调用方的 describe 回调渲染成原文片段。
     """
@@ -753,7 +766,7 @@ class CloudHotwordAlignPipeline:
         asr_text = _transcript_text(transcription)
         asr_end_time_ms = words[-1].get("end_time", 0) if words else 0
 
-        # 音频时长必须在覆盖闸门之前算：它是区分「音频缺料」与「ASR 漏转」的唯一判据，
+        # 音频时长必须在覆盖率校验之前算：它是区分「音频缺料」与「ASR 漏转」的唯一判据，
         # 写在 raise 之后等于失败时永远拿不到。
         import soundfile as sf
         import torch
@@ -988,11 +1001,22 @@ class CloudHotwordAlignPipeline:
             self._assert_fa_timestamps(
                 fa_res, audio_start_sec, audio_end_sec, chunk["index"], req_id
             )
+            # rebuild 用压平后的一份；健康度评分仍用 FA 原始输出，评的是模型本身。
+            disjoint_fa_res, fa_clamped, fa_max_overlap = normalize_fa_interval_overlaps(
+                fa_res, audio_start_sec, audio_end_sec
+            )
+            if fa_clamped:
+                log_warn(
+                    f"FA 区间重叠压平 | chunk[{chunk['index']}] | 压平 {fa_clamped} 个词条 | "
+                    f"最大压平 {fa_max_overlap * 1000:.0f}ms | "
+                    f"逐词估边共享时间是正常现象，压平后标点补位才落在后词起点之前",
+                    req_id=req_id,
+                )
 
             for w in fa_res:
                 all_word_alignments.append(w)
 
-            rebuilt_words = self._rebuild_words(ground_truth, fa_res, run_lang)
+            rebuilt_words = self._rebuild_words(ground_truth, disjoint_fa_res, run_lang)
             overlap_end = max(emitted_orig_end, orig_start)
             keep_from = max(0, overlap_end - orig_start)
             kept_words, fa_start = self._trim_rebuilt_words(
@@ -1012,7 +1036,10 @@ class CloudHotwordAlignPipeline:
                     "end": end,
                 })
                 word_origins.append(chunk_origin)
-                last_emitted = (start, end, w["text"], chunk_origin)
+                # 已输出最大 end 必须随流累积，不能只看上一项：标点被抬高的 end
+                # 要压住紧随其后的实词起点。
+                max_emitted_end = end if last_emitted is None else max(last_emitted[2], end)
+                last_emitted = (start, end, max_emitted_end, w["text"], chunk_origin)
             fa_text_parts.extend(w.text for w in fa_res[fa_start:])
             emitted_orig_end = max(emitted_orig_end, orig_end)
 
@@ -1072,37 +1099,53 @@ class CloudHotwordAlignPipeline:
             )
 
     def _enforce_seam_monotonicity(self, word_text, start, end, origin, last_emitted, req_id):
-        """强制跨 chunk 输出单调，吸收块接缝处的 FA 时间戳抖动。
+        """强制跨 chunk 输出时间单调，并保证相邻词条的时间区间不重叠。
 
-        重叠文本在相邻两个 chunk 里各对齐一次：重叠区本身由前一个 chunk 输出，
-        但紧随重叠区之后的词（典型为标点，继承当前块 FA 的前词 end）来自当前 chunk
-        的对齐，两者存在毫秒级差异，接缝处可能出现小幅时间回退。
-        回退 <= SEAM_JITTER_MAX_SEC 视为正常抖动，钳制到前项边界并 WARN；
+        只用于热词分块链路：只有这条链路按热词锚点切出重叠文本、把同一段对齐两次。
+        pipeline 的本地 ASR+FA 与纯 FA 按游标切文本、每段只对齐一次，不调用本方法。
+
+        重叠区由前一个 chunk 输出，但紧随其后的词（典型为标点，继承当前块 FA 的前词
+        end）来自当前 chunk 的对齐，两者存在毫秒级差异，接缝处可能出现小幅时间回退。
+
+        不变式是「每个词条的 start >= 之前所有已输出词条的 end」。只比前一项的
+        start/end 不够：标点补位会把前一项的 end 抬到它自己的 start 之后，紧随其后的
+        实词起点仍可能落在该 end 之前。此时点态单调成立、区间却重叠，下游按
+        「前词 end 补位」重建标点时就会变成时间回退（2026-10-17 第 4 章事故：
+        的 42.580..42.740 来自 chunk[1]，士 42.700..43.180 来自 chunk[2]）。
+
+        漂移 <= SEAM_JITTER_MAX_SEC 视为正常抖动，钳制到已输出最大 end 并 WARN；
         超过阈值判定为锚点错位/FA 漂移，Fail-Fast 抛错。
+        last_emitted = (start, end, 已输出最大 end, text, origin)。
         返回 (start, end, clamped)。
         """
         if last_emitted is None:
             return start, end, False
-        p_start, p_end, p_word, p_origin = last_emitted
-        regression = max(p_start - start, p_end - end)
-        if regression <= 0:
+        p_start, p_end, p_max_end, p_word, p_origin = last_emitted
+
+        new_start, new_end, overlap, regression = clamp_seam_interval(
+            p_start, p_end, p_max_end, start, end
+        )
+        if overlap <= 0 and regression <= 0:
             return start, end, False
-        if regression > SEAM_JITTER_MAX_SEC:
+
+        drift = max(overlap, regression)
+        if drift > SEAM_JITTER_MAX_SEC:
             message = (
-                f"❌ 跨 chunk 接缝时间戳回退超容差 | 回退={regression:.3f}s "
-                f"(容差={SEAM_JITTER_MAX_SEC}s) | "
-                f"前项'{p_word}' {p_start:.3f}..{p_end:.3f}s 来源={p_origin} | "
+                f"❌ 跨 chunk 接缝时间戳回退超容差 | 起点重叠={overlap:.3f}s | "
+                f"点态回退={regression:.3f}s (容差={SEAM_JITTER_MAX_SEC}s) | "
                 f"当前'{word_text}' {start:.3f}..{end:.3f}s 来源={origin} | "
+                f"前项'{p_word}' {p_start:.3f}..{p_end:.3f}s，此前最大 end={p_max_end:.3f}s "
+                f"来源={p_origin} | "
                 f"可能原因: 热词锚点(beginTime/endTime)错位或该段 FA 对齐漂移"
             )
             log_error(message, req_id=req_id)
             raise FaTimestampError(message)
-        new_start = max(start, p_start)
-        new_end = max(end, p_end)
+
         log_warn(
-            f"块接缝时间戳抖动钳制 | 回退={regression:.3f}s | "
+            f"块接缝时间戳钳制 | 起点重叠={overlap:.3f}s | 点态回退={regression:.3f}s | "
             f"'{word_text}' {start:.3f}..{end:.3f}s -> {new_start:.3f}..{new_end:.3f}s | "
-            f"前项'{p_word}' 来源={p_origin} | 当前来源={origin}",
+            f"前项'{p_word}' {p_start:.3f}..{p_end:.3f}s，此前最大 end={p_max_end:.3f}s "
+            f"来源={p_origin} | 当前来源={origin}",
             req_id=req_id,
         )
         return new_start, new_end, True
