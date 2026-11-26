@@ -3,19 +3,25 @@
 set -e
 
 echo "🚀 开始构建 Long Audio Aligner 运行环境..."
-# 如果系统存在 .bashrc 则加载，避免遗漏已有环境变量
-[ -f ~/.bashrc ] && source ~/.bashrc
 
 # ==========================================
-# 0. 全局网络环境检测 (最先确认，影响全局策略)
+# 0. 全局配置与网络环境检测 (最先确认，影响全局策略)
 # ==========================================
 echo ""
-read -p "❓ 当前是否处于国内网络环境? (y: 启用镜像加速与 HF-Mirror / n: 默认直连) [默认: y]: " use_domestic
+export MyWorkDir="/root/autodl-tmp/alignServer"
+export HF_TOKEN="REDACTED_HF_TOKEN"
+export MODEL_ROOT_DIR="/root/autodl-fs/models"
+
+# 创建目录
+mkdir -p "$MyWorkDir"
+mkdir -p "$MODEL_ROOT_DIR"
+cd "$MyWorkDir"
+
+read -p "❓ 当前是否处于国内网络环境? (y: 启用镜像加速 / n: 默认直连) [默认: y]: " use_domestic
 use_domestic=${use_domestic:-y}
 
 # 预设 PyPI 镜像、GitHub 代理和源码 ZIP 下载链接
 PYPI_MIRROR=""
-GH_PROXY=""
 QWEN_ASR_ZIP="https://github.com/QwenLM/Qwen3-ASR/archive/refs/heads/main.zip"
 
 if [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
@@ -52,12 +58,18 @@ if [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
             ;;
     esac
 
-    GH_PROXY="https://ghproxy.net/"
-    # 拼接国内代理 ZIP 链接，体积最小，速度最快
-    QWEN_ASR_ZIP="${GH_PROXY}${QWEN_ASR_ZIP}"
+    QWEN_ASR_ZIP="${QWEN_ASR_ZIP}"
 else
     echo "🌐 已开启海外直连模式"
 fi
+
+echo ""
+echo "📦 请选择大模型下载方式 (输入数字序号):"
+echo "  1) Hugging Face 官方直连"
+echo "  2) Hugging Face 国内镜像 (HF-Mirror) [默认]"
+echo "  3) ModelScope 魔搭社区"
+read -p "请输入序号 [默认: 2]: " dl_choice
+dl_choice=${dl_choice:-2}
 
 # ==========================================
 # 1. 前置工具检查与交互式安装
@@ -74,7 +86,7 @@ if ! command -v uv &> /dev/null; then
         python3 -m pip install uv $PYPI_MIRROR || pip install uv $PYPI_MIRROR
         
         # 尝试刷新环境变量
-        [ -f ~/.bashrc ] && source ~/.bashrc
+        [ -f $HOME/.bashrc ] && source $HOME/.bashrc
         if ! command -v uv &> /dev/null; then
             echo "[FATAL ERROR] uv 安装完成，但在当前环境变量 PATH 中未找到。可能安装到了用户目录（如 ~/.local/bin），请将其加入 PATH 或重启终端后再运行。"
             exit 1
@@ -96,7 +108,7 @@ if [ -d ".venv" ]; then
     echo "♻️ 检测到已存在 .venv 文件夹，准备复用当前虚拟环境..."
 else
     echo "[*] 正在使用 uv 创建纯净虚拟环境 .venv..."
-    uv venv
+    uv venv .venv -p 3.12 --allow-existing
 fi
 source .venv/bin/activate 
 
@@ -107,27 +119,37 @@ echo ""
 read -p "❓ 当前机器是否支持并需使用 NVIDIA GPU (CUDA)? (y: 使用 GPU / n: 使用 CPU) [默认: y]: " use_gpu
 use_gpu=${use_gpu:-y}
 
-INSTALL_TARGET="."
 INDEX_URL=""
+EXTRA_ARGS="" # 改用 EXTRA_ARGS 传参
 
 if [[ "$use_gpu" == "y" || "$use_gpu" == "Y" ]]; then
     DEVICE_ENV="cuda"
     INDEX_URL="--extra-index-url https://download.pytorch.org/whl/cu121"
-    # 现在统一走 HF 生态，不再区分 ms 或 hf
-    INSTALL_TARGET=".[GPU,hf]"
+    EXTRA_ARGS="--extra GPU --extra hf"
 else
     DEVICE_ENV="cpu"
     INDEX_URL="--extra-index-url https://download.pytorch.org/whl/cpu"
-    INSTALL_TARGET=".[CPU,hf]"
+    EXTRA_ARGS="--extra CPU --extra hf"
 fi
 
 # ==========================================
 # 4. 严格按照 pyproject.toml 声明安装基础依赖
 # ==========================================
 echo ""
-echo "[*] 正在执行规范安装: uv pip install -e \"$INSTALL_TARGET\" $PYPI_MIRROR $INDEX_URL ..."
-# uv pip install 是幂等的，如果环境里已经有了符合要求的包，它会极速跳过
-uv pip install -e "$INSTALL_TARGET" $PYPI_MIRROR $INDEX_URL
+echo "[*] 正在执行规范安装..."
+
+if [[ "$use_gpu" == "y" || "$use_gpu" == "Y" ]]; then
+    # 💡 GPU 模式下，强行直接指定从 PyTorch 官方源下载对应的 CUDA 12.1 版本，防止被国内镜像源的 CPU 版覆盖
+    echo "  -> 正在强制锁定安装 GPU (CUDA 12.1) 版本的 Torch 生态..."
+    uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+else
+    echo "  -> 正在安装 CPU 版本的 Torch 生态..."
+    uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+fi
+
+# 安装剩余的常规依赖（如 fastapi, silero-vad 等）
+echo "  -> 正在安装 pyproject.toml 中的其他配套依赖..."
+uv pip install -r pyproject.toml $EXTRA_ARGS $PYPI_MIRROR
 
 # ==========================================
 # 4.5 独立安装 Flash Attention 2 (仅限 GPU)
@@ -168,76 +190,82 @@ echo "[*] 正在极速拉取并安装 Qwen3-ASR 核心包与底层依赖..."
 uv pip install "$QWEN_ASR_ZIP" $PYPI_MIRROR $INDEX_URL
 
 # ==========================================
-# 6. 本地化下载大模型 (Qwen) - HF-Mirror 版
+# 6. 本地化下载大模型 (Qwen) - 多选版
 # ==========================================
 echo ""
-mkdir -p ./models/Qwen3-ASR-0.6B
-mkdir -p ./models/Qwen3-ForcedAligner-0.6B
+mkdir -p "$MODEL_ROOT_DIR/Qwen"
 
 # 清理可能导致网络绕路的代理环境变量
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
-echo "[*] 正在更新并安装官方 Hugging Face CLI 及加速模块..."
-# 使用 pip 升级/安装 huggingface_hub，同时安装 hf-transfer 以开启多线程加速
-pip install --upgrade huggingface_hub hf-transfer $PYPI_MIRROR
+# 定义下载逻辑的函数以减少代码冗余
+download_model() {
+    local repo_id=$1
+    local local_dir=$2
+    
+    if [ -d "$local_dir" ] && [ "$(ls -A $local_dir 2>/dev/null)" ]; then
+        echo "    ✅ 检测到模型 $repo_id 已存在于 $local_dir，跳过下载..."
+    else
+        echo "    -> 开始下载 $repo_id..."
+        if [ "$dl_choice" == "3" ]; then
+            modelscope download --model="$repo_id" --local-dir "$local_dir"
+        else
+            # 兼容别名及标准工具
+            if command -v hf &> /dev/null; then
+                hf download "$repo_id" --local-dir "$local_dir"
+            else
+                HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download "$repo_id" --local-dir "$local_dir"
+            fi
+        fi
+    fi
+}
 
-# 开启底层 hf-transfer 极速下载机制
-export HF_HUB_ENABLE_HF_TRANSFER=1
-
-if [[ "$use_domestic" == "y" || "$use_domestic" == "Y" ]]; then
+if [ "$dl_choice" == "3" ]; then
+    echo "[*] 正在使用 ModelScope 魔搭社区进行下载..."
+    pip install modelscope $PYPI_MIRROR
+elif [ "$dl_choice" == "2" ]; then
     echo "[*] 已切换至 HF-Mirror 国内镜像源，准备满速拉取模型..."
     export HF_ENDPOINT=https://hf-mirror.com
+    pip install --upgrade huggingface_hub hf-transfer $PYPI_MIRROR
 else
     echo "[*] 正在从 Hugging Face 官方直连下载模型..."
+    pip install --upgrade huggingface_hub hf-transfer $PYPI_MIRROR
 fi
 
-# 使用官方标准的 hf 命令执行下载
-echo "    -> 开始下载 Qwen3-ASR-0.6B..."
-hf download Qwen/Qwen3-ASR-0.6B --local-dir ./models/Qwen3-ASR-0.6B
-
-echo "    -> 开始下载 Qwen3-ForcedAligner-0.6B..."
-hf download Qwen/Qwen3-ForcedAligner-0.6B --local-dir ./models/Qwen3-ForcedAligner-0.6B
+# 开始下载 Qwen3-ASR 及其强制对齐模型 (MS与HF仓库名一致)
+download_model "Qwen/Qwen3-ASR-0.6B" "$MODEL_ROOT_DIR/Qwen/Qwen3-ASR-0.6B"
+download_model "Qwen/Qwen3-ForcedAligner-0.6B" "$MODEL_ROOT_DIR/Qwen/Qwen3-ForcedAligner-0.6B"
 
 # ==========================================
-# 7. 预热并下载 VAD 小模型 (解决 PyTorch Hub 交互式卡顿)
+# 7. 预热并下载 VAD 小模型 (优雅的包触发)
 # ==========================================
 echo ""
-echo "[*] 正在预先下载并信任 Silero VAD 模型..."
-# 使用 yes 命令自动向 Python 脚本输入 'y'，解决下载时询问 "Do you trust this repository" 的停顿问题
-yes y | python -c "
-import torch
-try:
-    print('  -> 正在通过 PyTorch Hub 拉取 Silero VAD...')
-    torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', trust_repo=True, verbose=False)
-except TypeError:
-    torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', verbose=False)
-" > /dev/null 2>&1
-echo "✅ Silero VAD 模型已预热并下载完毕！"
+echo "[*] 正在预先下载并缓存 Silero VAD 模型..."
+# 不再需要 yes y | 管道拦截
+python -c "
+from silero_vad import load_silero_vad
+load_silero_vad()
+"
+echo "✅ Silero VAD 模型已预热下载完毕！"
 
 # ==========================================
-# 8. 生成 Server 配置文件 (已固定默认值)
+# 8. 生成 Server 配置文件 
 # ==========================================
 echo ""
-echo "[*] 开始配置 Web 服务信息 (默认绑定 127.0.0.1:6006)..."
+echo "[*] 开始配置 Web 服务信息 (默认绑定 127.0.0.1:6008)..."
 
 SERVER_HOST="127.0.0.1"
-SERVER_PORT="6006"
+SERVER_PORT="6008"
 
 echo "[*] 正在生成 .env 环境变量配置文件..."
-
-PROJECT_ROOT=$(pwd)
 
 cat <<EOF > .env
 # 硬件加速模式
 DEVICE=$DEVICE_ENV
 
-# VAD 模型配置
-VAD_REPO=snakers4/silero-vad
-VAD_MODEL_NAME=silero_vad
-
 # 本地化模型绝对路径
-ASR_MODEL_PATH=$PROJECT_ROOT/models/Qwen3-ASR-0.6B
-FA_MODEL_PATH=$PROJECT_ROOT/models/Qwen3-ForcedAligner-0.6B
+ASR_MODEL_PATH=$MODEL_ROOT_DIR/Qwen/Qwen3-ASR-0.6B
+FA_MODEL_PATH=$MODEL_ROOT_DIR/Qwen/Qwen3-ForcedAligner-0.6B
 
 # FastAPI 服务配置
 HOST=$SERVER_HOST
@@ -247,9 +275,10 @@ EOF
 # 注意：swapoff 需要 root 权限，如果在非 root 环境执行会报错导致脚本退出（因为上方开启了 set -e）
 # 如果用户没有 root 权限，可以加上 || true 防止脚本意外中断
 echo "正在尝试关闭 swap 内存交互，避免数据从内存卸载到硬盘..."
-sudo swapoff -a || true 
+swapoff -a || true 
 
 echo ""
 echo "✅ 环境配置与所有模型（Qwen & VAD）全量下载完毕！"
 echo "🚀 正在启动服务..."
+# uv run --no-project python main.py
 source .venv/bin/activate && python main.py

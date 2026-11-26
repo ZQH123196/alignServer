@@ -10,9 +10,10 @@ dependencies = [
     "zhconv>=1.4.3",
     "Levenshtein>=0.25.1",       # 底层为 C 的高性能比对引擎
     "python-dotenv>=1.0.1",      # 用于自动加载 .env 环境变量
-    "psutil>=5.0.0",             # [新增] 动态内存监控与探针
+    "psutil>=5.0.0",             # 动态内存监控与探针
     "transformers>=4.40.0",      # Qwen 模型基础依赖
     "accelerate>=0.30.0",        # 模型设备映射与加速
+    "silero-vad>=5.1.0",         # [新增] 改用 pip 托管官方 VAD 库
     # Web 服务与 UI 依赖
     "fastapi>=0.100.0",          
     "uvicorn>=0.23.0",           
@@ -30,9 +31,5 @@ CPU = ["torch", "torchaudio"]
 hf = ["huggingface_hub[cli]"]    # 国外 hf 命令行
 ms = ["modelscope"]              # 国内 ModelScope
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["server.py"]
+[tool.uv]
+package = false
