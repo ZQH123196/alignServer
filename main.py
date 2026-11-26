@@ -217,7 +217,7 @@ def log_fatal(*args, queue: bool = False, **kw) -> None:
 
 
 # [修改点 1]：引入我们新定义的 AlignmentThresholdError
-from pipeline import LongAudioAlignPipeline, AlignmentThresholdError
+from pipeline import LongAudioAlignPipeline, AlignmentThresholdError, build_sampling_params
 
 load_dotenv()
 
@@ -335,7 +335,10 @@ async def openai_asr_endpoint(
     model: str = Form(..., description="强制要求：必须指定合法的 ForcedAligner 或 ASR 模型名称"),
     prompt: str = Form(default="", description="对齐模式(FA)必填，纯ASR模式选填/忽略"),
     response_format: str = Form(default="json", description="支持 json 或 verbose_json"),
-    language: str = Form(default=None, description="语言")
+    language: str = Form(default=None, description="语言"),
+    temperature: float = Form(default=None, description="采样温度（0=贪心；>0 采样；仅纯ASR模式生效）"),
+    top_p: float = Form(default=None, description="top-p 采样（可选；仅纯ASR模式生效）"),
+    n: int = Form(default=None, description="一次返回 n 条候选（可选；仅纯ASR模式生效）"),
 ):
     global active_gpu_requests
     
@@ -365,6 +368,19 @@ async def openai_asr_endpoint(
             if response_format != "verbose_json":
                 mark_failed(req_id)
                 raise HTTPException(status_code=400, detail={"error": {"message": "Only 'verbose_json' response_format is supported.", "type": "invalid_request_error"}})
+            if temperature is not None or top_p is not None or n is not None:
+                mark_failed(req_id)
+                raise HTTPException(status_code=400, detail={"error": {"message": "Sampling params (temperature/top_p/n) are only valid in ASR mode.", "type": "invalid_request_error"}})
+
+        if temperature is not None and not (0.0 <= temperature <= 2.0):
+            mark_failed(req_id)
+            raise HTTPException(status_code=400, detail={"error": {"message": "temperature must be in [0, 2].", "type": "invalid_request_error"}})
+        if top_p is not None and not (0.0 < top_p <= 1.0):
+            mark_failed(req_id)
+            raise HTTPException(status_code=400, detail={"error": {"message": "top_p must be in (0, 1].", "type": "invalid_request_error"}})
+        if n is not None and not (1 <= n <= 10):
+            mark_failed(req_id)
+            raise HTTPException(status_code=400, detail={"error": {"message": "n must be in [1, 10].", "type": "invalid_request_error"}})
 
         suffix = os.path.splitext(file.filename)[1] if file.filename else ".wav"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -394,8 +410,23 @@ async def openai_asr_endpoint(
                                     pipeline_instance.process_audio, audio_path=tmp_path, reference_text=prompt, language_code=language, req_id=req_id
                                 )
                             else:
+                                sampling_params = build_sampling_params(
+                                    pipeline_instance.asr_model,
+                                    temperature=temperature,
+                                    top_p=top_p,
+                                    n=n,
+                                )
+                                if sampling_params is not None:
+                                    log_info(
+                                        f"🎛️ 采样参数 | temperature={sampling_params.temperature}, top_p={sampling_params.top_p}, n={sampling_params.n}",
+                                        req_id=req_id,
+                                    )
                                 result = await run_in_threadpool(
-                                    pipeline_instance.process_audio_asr_only, audio_path=tmp_path, language_code=language, req_id=req_id
+                                    pipeline_instance.process_audio_asr_only,
+                                    audio_path=tmp_path,
+                                    language_code=language,
+                                    req_id=req_id,
+                                    sampling_params=sampling_params,
                                 )
                                 
                             mark_done(req_id)

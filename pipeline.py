@@ -79,8 +79,11 @@ class AsrBatchScheduler:
         self._worker = threading.Thread(target=self._flush_loop, name="AsrBatchScheduler", daemon=True)
         self._worker.start()
 
-    def submit(self, audios, language, req_id="Unknown"):
-        """提交本请求的所有 audio chunks，阻塞直到结果返回。
+    def submit(self, audios, language, req_id="Unknown", sampling_params=None):
+        """提交本请求的所有 audio chunks（带采样参数），阻塞直到结果返回。
+
+        sampling_params：可选 vLLM SamplingParams（「生成定调文本（calibration）」温度采样用）；
+        None = 贪心解码。flush 时按采样签名分组，贪心请求不与采样请求混批。
         超过 max_pending_chunks 时分批排队（等前一批消化完再提交下一批），不拒绝。
         """
         if not audios:
@@ -90,12 +93,12 @@ class AsrBatchScheduler:
         offset = 0
         while offset < len(audios):
             batch = audios[offset:offset + self.max_pending_chunks]
-            batch_results = self._submit_batch(batch, language, req_id)
+            batch_results = self._submit_batch(batch, language, req_id, sampling_params)
             results[offset:offset + len(batch)] = batch_results
             offset += len(batch)
         return results
 
-    def _submit_batch(self, audios, language, req_id="Unknown"):
+    def _submit_batch(self, audios, language, req_id="Unknown", sampling_params=None):
         """提交一批 audios（不超过 max_pending_chunks），阻塞等待结果。"""
         if not audios:
             return []
@@ -105,7 +108,7 @@ class AsrBatchScheduler:
         holder = [None]
 
         with self._lock:
-            self._pending.append((audios, language, holder, event, count))
+            self._pending.append((audios, language, sampling_params, holder, event, count))
             self._cv.notify()
 
         event.wait()
@@ -115,48 +118,116 @@ class AsrBatchScheduler:
             raise result
         return result
 
+    @staticmethod
+    def _sampling_signature(sampling_params):
+        """采样参数签名：贪心请求与不同采样参数的请求不得混批。"""
+        if sampling_params is None:
+            return "greedy"
+        return (sampling_params.temperature, sampling_params.top_p, sampling_params.n)
+
     def _flush_loop(self):
-        """单线程 worker：攒批 -> 调用 transcribe -> 切分结果 -> 唤醒等待者。"""
+        """单线程 worker：攒批 -> 按采样参数分组 -> 调用 transcribe -> 切分结果 -> 唤醒等待者。"""
         while True:
             with self._cv:
                 while not self._pending:
                     self._cv.wait()
                 self._cv.wait(timeout=self.max_wait_ms / 1000.0)
 
-                batch = []
-                taken = 0
+                buckets = {}
                 remaining = []
                 for item in self._pending:
-                    count = item[4]
-                    if taken == 0 or taken + count <= self.max_batch_size:
-                        batch.append(item)
-                        taken += count
+                    audios, lang, sampling, holder, event, count = item
+                    key = self._sampling_signature(sampling)
+                    bucket = buckets.get(key)
+                    if bucket is None:
+                        bucket = {"sampling": sampling, "items": [], "taken": 0}
+                        buckets[key] = bucket
+                    if bucket["taken"] == 0 or bucket["taken"] + count <= self.max_batch_size:
+                        bucket["items"].append(item)
+                        bucket["taken"] += count
                     else:
                         remaining.append(item)
                 self._pending = remaining
 
-            if not batch:
+            if not buckets:
                 continue
 
-            all_audios = []
-            all_langs = []
-            for audios, lang, _, _, count in batch:
-                all_audios.extend(audios)
-                all_langs.extend([lang] * count)
+            for bucket in buckets.values():
+                batch = bucket["items"]
+                all_audios = []
+                all_langs = []
+                for audios, lang, _, _, _, count in batch:
+                    all_audios.extend(audios)
+                    all_langs.extend([lang] * count)
 
-            try:
-                results = self.asr_model.transcribe(audio=all_audios, language=all_langs)
-            except Exception as err:
-                for _, _, holder, event, _ in batch:
-                    holder[0] = err
+                try:
+                    results = self.asr_model.transcribe(
+                        audio=all_audios,
+                        language=all_langs,
+                        sampling_params=bucket["sampling"],
+                    )
+                except Exception as err:
+                    for _, _, _, holder, event, _ in batch:
+                        holder[0] = err
+                        event.set()
+                    continue
+
+                i = 0
+                for _, _, _, holder, event, count in batch:
+                    holder[0] = results[i:i + count]
                     event.set()
-                continue
+                    i += count
 
-            i = 0
-            for _, _, holder, event, count in batch:
-                holder[0] = results[i:i + count]
-                event.set()
-                i += count
+
+class Qwen3ASRSamplingModel(Qwen3ASRModel):
+    """支持 per-call 解码参数的 Qwen3-ASR 包装。
+
+    背景：qwen_asr v0.0.6 的 transcribe() 不暴露解码参数，vLLM SamplingParams
+    在 from_pretrained() 时写死 temperature=0.0（贪心）。「生成定调文本（calibration）」
+    需要温度采样产生多样候选做共识投票；对齐模式必须保持贪心。
+    AsrBatchScheduler 保证单线程调用 generate()（见其类文档），因此临时替换
+    sampling_params 是安全的。
+    """
+
+    def transcribe(
+        self,
+        audio,
+        context="",
+        language=None,
+        return_time_stamps=False,
+        sampling_params=None,
+    ):
+        if sampling_params is None:
+            return super().transcribe(audio, context, language, return_time_stamps)
+        prev = self.sampling_params
+        self.sampling_params = sampling_params
+        try:
+            return super().transcribe(audio, context, language, return_time_stamps)
+        finally:
+            self.sampling_params = prev
+
+
+def build_sampling_params(asr_model, temperature=None, top_p=None, n=None):
+    """构造 vLLM SamplingParams；任一解码参数给定才构造，全 None 返回 None（贪心）。
+
+    max_tokens 沿用模型初始化时的采样参数，避免新参数覆盖生成长度限制。
+    """
+    if temperature is None and top_p is None and n is None:
+        return None
+    from vllm import SamplingParams
+
+    base = getattr(asr_model, "sampling_params", None)
+    kwargs = {}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if top_p is not None:
+        kwargs["top_p"] = top_p
+    if n is not None:
+        kwargs["n"] = n
+    max_tokens = getattr(base, "max_tokens", None)
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    return SamplingParams(**kwargs)
 
 
 class LongAudioAlignPipeline:
@@ -208,7 +279,7 @@ class LongAudioAlignPipeline:
 
         self.vad_model = load_silero_vad() 
         self.get_speech_timestamps = get_speech_timestamps
-        self.asr_model = Qwen3ASRModel.from_pretrained(asr_path, **model_kwargs)
+        self.asr_model = Qwen3ASRSamplingModel.from_pretrained(asr_path, **model_kwargs)
         # Qwen3-ForcedAligner 边缘情况：FA 是强制对齐器，不做文本识别。
         # fa_res.text 永远是输入文本的回声；输入过量/不匹配音频的文本时，
         # FA 仍会给所有词分配时间戳（伪插值），结果毫无价值。
@@ -1750,7 +1821,7 @@ class LongAudioAlignPipeline:
         except Exception as outer_err:
             raise outer_err
 
-    def process_audio_asr_only(self, audio_path, language_code=None, req_id="Unknown"):
+    def process_audio_asr_only(self, audio_path, language_code=None, req_id="Unknown", sampling_params=None):
         pipeline_start_time = time.time()
         run_lang = language_code if language_code else self.config["language"]
 
@@ -1796,7 +1867,12 @@ class LongAudioAlignPipeline:
             asr_stage_start = time.time()
 
             try:
-                asr_results = self.asr_scheduler.submit(audios=batch_audios, language=run_lang, req_id=req_id)
+                asr_results = self.asr_scheduler.submit(
+                    audios=batch_audios,
+                    language=run_lang,
+                    req_id=req_id,
+                    sampling_params=sampling_params,
+                )
             except Exception as err:
                 log_error(f"阶段: 纯ASR模型批量推理崩溃 | 详情: {err}", req_id=req_id)
                 raise
