@@ -467,7 +467,7 @@ class NormalizeCallSiteTests(unittest.TestCase):
     SITES = (
         ("pipeline.py", "def _emit_fa(", "_rebuild_words_from_ground_truth(ground_truth, disjoint_fa_res, run_lang)"),
         ("pipeline.py", "for chunk_info, ground_truth, fa_res in aligned_chunks:", "rebuilt_words = self._rebuild_words_from_ground_truth("),
-        ("cloud_hotword.py", "self._assert_fa_timestamps(", "_rebuild_words(ground_truth, disjoint_fa_res, run_lang)"),
+        ("cloud_hotword.py", "self._assert_fa_timestamps(", "self._rebuild_words("),
     )
 
     def test_every_call_site_normalizes_before_rebuild(self) -> None:
