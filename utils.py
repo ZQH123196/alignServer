@@ -3,21 +3,6 @@ import math
 import multiprocessing
 import psutil
 
-
-def normalize_multipart_line_endings(text):
-    r"""把 multipart 表单字段里的 CRLF 还原成 LF。
-
-    multipart/form-data 的行尾是 CRLF，Node 的 FormData（undici）实测会把字段值里的
-    `\n` 编码成 `\r\n`；Python / curl 客户端直传 `\n` 不发生这个转换。服务端按字面
-    收下后，参考文本每行多出一个 `\r`，与调用方持有的原文不再逐字相等
-    （2026-10-17 第 4 章：2136 字的原文被当成 2210 字，74 个换行各多一个字符）。
-
-    在 HTTP 入口统一还原，参考文本与调用方逐字一致。孤立 `\r`（旧 Mac 行尾）
-    同样按换行处理，避免它被下游的空白折叠规则变成一个普通空格。
-    """
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
 # ==========================================
 # 0. 容器资源获取辅助函数 (已修订探针优先级)
 # ==========================================

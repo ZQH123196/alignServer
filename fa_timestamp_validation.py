@@ -24,34 +24,9 @@ FA_BOUNDARY_JITTER_SEC = 0.5
 FA_WINDOW_OVERFLOW_RATIO = 0.05
 FA_WINDOW_OVERFLOW_MAX_SEC = 2.0
 
-# 时间戳 round 到毫秒后的浮点尾差上限（秒）。差量小于 1µs 视为相等，不钳制。
-SEAM_TIME_EPSILON = 1e-6
-
 
 class FaTimestampError(ValueError):
     """FA timestamps are invalid within a chunk or across the final output."""
-
-
-def clamp_seam_interval(previous_start, previous_end, previous_max_end, start, end):
-    """把当前词条的区间抬到「此前所有已输出词条的 end 之后」。
-
-    不变式：当前词条的 start >= 此前所有已输出词条的 end。只比前一项的 start/end
-    不够：标点补位会把前一项的 end 抬到它自己的 start 之后，紧随其后的实词起点仍可能
-    落在该 end 之前。此时点态单调成立、区间却重叠，下游按「前词 end 补位」重建标点时
-    就会变成时间回退（2026-10-17 第 4 章：的 42.580..42.740 来自 chunk[1]，
-    士 42.700..43.180 来自 chunk[2]，标点 〖 被补在 42.740）。
-
-    返回 (new_start, new_end, start_overlap, point_regression)。
-    两个差量是原始差值，<= 0 表示没有；调用方用它们决定 WARN 还是抛错。
-    小于 1µs 的浮点尾差按「没有」处理，原样返回入参。
-    """
-    overlap = previous_max_end - start
-    regression = max(previous_start - start, previous_end - end)
-    if overlap <= SEAM_TIME_EPSILON and regression <= SEAM_TIME_EPSILON:
-        return start, end, 0.0, 0.0
-    new_start = max(start, previous_start, previous_max_end)
-    new_end = max(end, new_start)
-    return new_start, new_end, max(0.0, overlap), max(0.0, regression)
 
 
 def _read_timestamp(item, key):

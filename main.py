@@ -25,15 +25,6 @@ def boot(msg: str) -> None:
 
 boot("进程已启动 | 正在导入 torch / numpy / fastapi / uvicorn（静默阶段）...")
 
-# libgomp（torch 自带的 OpenMP 运行库）在 .so 被 dlopen 时读一次 OMP_NUM_THREADS，
-# 要求正整数。系统镜像注入的 0 是无效值，libgomp 报错并回退到宿主机核数。
-# 系统文件不能改，在 import torch 之前覆盖成容器配额。
-# pipeline 内还会用 torch.set_num_threads 按 cpu_ratio 再收紧，这里只定上限。
-from utils import get_container_cpu_count
-
-os.environ["OMP_NUM_THREADS"] = str(get_container_cpu_count())
-os.environ["MKL_NUM_THREADS"] = str(get_container_cpu_count())
-
 import json
 import asyncio
 import gc
@@ -55,7 +46,7 @@ from env_config import (
     check_lockfile,
     load_server_env,
 )
-from utils import get_container_available_memory, normalize_multipart_line_endings
+from utils import get_container_cpu_count, get_container_available_memory
 import transformers
 transformers.logging.set_verbosity_error()
 # set_verbosity_error() 连带关掉权重加载进度条，静默只能靠阶段日志兜住。
@@ -413,10 +404,6 @@ async def openai_asr_endpoint(
     global active_gpu_requests
     
     req_id = str(uuid.uuid4())[:8]
-    # multipart 的字段值会被调用方（Node FormData 实测如此）编码成 CRLF。参考文本是
-    # 「调用方原文的逐字副本」，必须在入口还原成 LF，否则每行多一个字符，词级时间戳
-    # 与 chunk 下标都会与调用方持有的原文错位。
-    prompt = normalize_multipart_line_endings(prompt)
     is_alignment_mode = (model in VALID_ALIGNMENT_MODELS)
     is_fa_only_mode = (model in VALID_FA_ONLY_MODELS)
     is_cloud_hotword_mode = (model in VALID_CLOUD_HOTWORD_MODELS)
