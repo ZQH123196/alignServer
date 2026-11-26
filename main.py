@@ -8,7 +8,7 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 _BOOT_AT = _time.monotonic()
-_BOOT_TOTAL = 6
+_BOOT_TOTAL = 7
 _boot_step = 0
 
 
@@ -37,6 +37,7 @@ os.environ["MKL_NUM_THREADS"] = str(get_container_cpu_count())
 import json
 import asyncio
 import gc
+import jieba
 import torch
 import numpy as np
 import uvicorn
@@ -337,6 +338,10 @@ async def lifespan(app: FastAPI):
     
     log_info("服务初始化中...")
     log_block(["启动配置"] + SERVER_ENV.describe() + ([_HARDWARE_RECEIPT] if _HARDWARE_RECEIPT else []))
+    boot("正在加载分词词典（jieba）...")
+    jieba_at = _time.time()
+    jieba.initialize()
+    log_info(f"分词词典加载完成 | 耗时 {_time.time() - jieba_at:.1f}s")
     boot("正在加载本地模型权重（Silero VAD + Qwen3-ASR + ForcedAligner，静默阶段）...")
     load_at = _time.time()
     pipeline_instance = LongAudioAlignPipeline(CONFIG)

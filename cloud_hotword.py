@@ -14,13 +14,14 @@ from fa_timestamp_validation import (
     validate_absolute_timestamps,
     validate_fa_timestamps_in_chunk,
 )
-from hotword_matching import (
-    assess_reference_coverage,
-    build_asr_stream,
-    find_best_span,
-    find_tail_matches,
-    select_monotonic_chain,
+from fallback_chunks import build_fallback_chunks
+from hotword_matching import assess_reference_coverage, build_asr_stream
+from occurrence_matching import (
+    build_reference_offset_lookup,
+    match_hotword_anchors,
+    sample_anchors,
 )
+from term_selection import select_hotword_terms
 
 # 繁简转换只在本文件之外的 pipeline 分支使用；本分支的 norm 下标必须与切块同源，
 # 故这里不再做 zhconv 改写（改写会改变文本长度，正是 2026-10-18 第 44 章漂移的成因）。
@@ -44,7 +45,7 @@ from main import log, log_info, log_warn, log_error, log_block, get_task_info
 #
 # 本分支当前仅放行 zh / en；未来扩展其他语言时，把目标代码加入
 # SUPPORTED_LANGUAGES 即可（热词提取/归一化目前只对中英做了专门适配，
-# 其余语言需先验证 extract_hotwords / norm_for_match 的行为）。
+# 其余语言需先验证 term_selection / norm_for_match 的行为）。
 SUPPORTED_LANGUAGES = {"zh", "en"}
 
 LANGUAGE_ALIASES = {
@@ -70,11 +71,7 @@ CLOUD_ASR_MODEL = "qwen-audio-3.1-asr-flash-filetrans"
 CLOUD_ASR_ENDPOINT = f"{DASHSCOPE_BASE}/services/audio/asr/transcription"
 
 HOTWORD_WEIGHT = 4
-MAX_HOTWORDS = 2000
-CHUNK_SEC = 60
-HOTWORDS_PER_CHUNK = 3
-PARTIAL_MATCH_RATIO = 0.8
-PARTIAL_MIN_LEN = 5
+ANCHOR_GAP_WARN_MS = 60_000
 FA_MAX_SEC = 270
 TEXT_RATE_BY_LANG = {"zh": 4.5, "en": 12.5}
 TAIL_TEXT_CAPACITY_FACTOR = 1.8
@@ -113,11 +110,6 @@ EN_ONES = {
 EN_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
 EN_SCALES = {"hundred": 100, "thousand": 1000, "million": 1000000, "billion": 1000000000}
 
-def _is_punct(ch):
-    cat = unicodedata.category(ch)
-    return cat.startswith("P") or cat.startswith("S")
-
-
 def _is_match_char(ch):
     """参与匹配的字符：字母、数字、组合标记。
 
@@ -125,7 +117,7 @@ def _is_match_char(ch):
     `isAllowedTtsChar`）：TTS 那份额外保留若干标点，而标点在这里必须删（ASR 不转写停顿）。
     除此之外两侧保留集逐类别相同 —— 因此 TTS 删掉的字符，这里一定也删。
 
-    不能写成 `not _is_punct(ch)`：那样会漏掉 `C` 组（零宽空格、BOM、控制符），
+    不能写成「非标点即保留」：那样会漏掉 `C` 组（零宽空格、BOM、控制符），
     它们是不可见字符，留在归一化结果里就是凭空的参考字。
 
     版本偏差（已知、可接受）：`unicodedata` 的 Unicode 版本可能落后于 Node 的 ICU
@@ -295,93 +287,6 @@ def norm_for_match(s, lang):
     return norm_for_match_with_map(s, lang)[0]
 
 
-def _is_contraction_apostrophe(line, i):
-    ch = line[i]
-    if ch not in ("'", "\u2019"):
-        return False
-    return i > 0 and i < len(line) - 1 and line[i - 1].isalpha() and line[i + 1].isalpha()
-
-
-def _split_clauses(line):
-    clauses = []
-    current = ""
-    for i, ch in enumerate(line):
-        if _is_punct(ch) and not _is_contraction_apostrophe(line, i):
-            if current.strip():
-                clauses.append(current.strip())
-            current = ""
-        else:
-            current += ch
-    if current.strip():
-        clauses.append(current.strip())
-    return clauses
-
-
-def _is_valid_hotword_zh(clause):
-    stripped = re.sub(r'\s+', '', clause)
-    return 5 <= len(stripped) <= 15
-
-
-def _is_valid_hotword_en(clause):
-    words = clause.strip().split()
-    return 2 <= len(words) <= 7
-
-
-def extract_hotwords(txt_content, lang):
-    lines = txt_content.split("\n")
-    full_norm = norm_for_match("\n".join(lines), lang)
-    is_zh = lang == "zh"
-
-    candidates = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        for clause in _split_clauses(stripped):
-            valid = _is_valid_hotword_zh(clause) if is_zh else _is_valid_hotword_en(clause)
-            if not valid:
-                continue
-            norm_text = norm_for_match(clause, lang)
-            if not norm_text:
-                continue
-            count = full_norm.count(norm_text)
-            if count != 1:
-                continue
-            offset = full_norm.index(norm_text)
-            candidates.append({"text": clause, "normText": norm_text, "offset": offset})
-
-    candidates.sort(key=lambda c: c["offset"])
-
-    rate = TEXT_RATE_BY_LANG["zh" if is_zh else "en"]
-    total_chars = len(full_norm)
-    est_duration_sec = total_chars / rate
-    num_segments = max(1, int(est_duration_sec / CHUNK_SEC) + (1 if est_duration_sec % CHUNK_SEC else 0))
-    chars_per_segment = total_chars / num_segments
-
-    selected = []
-    seen_norms = set()
-    for seg in range(num_segments):
-        seg_start = seg * chars_per_segment
-        seg_end = (seg + 1) * chars_per_segment
-        in_seg = [c for c in candidates if seg_start <= c["offset"] < seg_end]
-        if not in_seg:
-            continue
-        step = len(in_seg) / HOTWORDS_PER_CHUNK
-        for i in range(HOTWORDS_PER_CHUNK):
-            idx = min(int(i * step), len(in_seg) - 1)
-            c = in_seg[idx]
-            if c["normText"] not in seen_norms:
-                seen_norms.add(c["normText"])
-                selected.append({
-                    "text": c["text"],
-                    "normText": c["normText"],
-                    "offsetInFullNorm": c["offset"],
-                    "segmentIndex": seg,
-                })
-
-    return selected[:MAX_HOTWORDS]
-
-
 def _upload_oss(local_path, req_id="Unknown"):
     api_key = server_env().dashscope_apikey
     policy_url = f"{DASHSCOPE_BASE}/uploads?action=getPolicy&model={CLOUD_ASR_MODEL}"
@@ -420,16 +325,19 @@ def _upload_oss(local_path, req_id="Unknown"):
 
 def _submit_cloud_asr(file_url, lang, vocabulary, req_id="Unknown"):
     api_key = server_env().dashscope_apikey
+    parameters = {
+        "channel_id": [0],
+        "enable_itn": False,
+        "language": lang,
+        "enable_words": True,
+    }
+    # 空词表必须整个键都不传：传空对象会被上游判成参数错误。
+    if vocabulary:
+        parameters["vocabulary"] = vocabulary
     body = {
         "model": CLOUD_ASR_MODEL,
         "input": {"file_urls": [file_url]},
-        "parameters": {
-            "channel_id": [0],
-            "enable_itn": False,
-            "language": lang,
-            "enable_words": True,
-            "vocabulary": vocabulary,
-        },
+        "parameters": parameters,
     }
     resp = requests.post(
         CLOUD_ASR_ENDPOINT,
@@ -505,94 +413,10 @@ def _transcript_text(transcription):
     return ""
 
 
-def _match_hotwords(hotwords, words, lang):
-    stream, char_to_word = build_asr_stream(words, lang, norm_for_match)
+def _build_chunks(anchors, full_norm_len, total_duration_ms):
+    """按锚点切块。anchors 是已抽样的锚点，按参考位置升序。"""
 
-    matched = []
-    partial_matched = []
-    unmatched = []
-    duplicate_in_asr = []
-    search_cursor = 0
-
-    for hw in hotwords:
-        norm = hw["normText"]
-        first_idx = stream.find(norm, search_cursor)
-        if first_idx >= 0:
-            second_idx = stream.find(norm, first_idx + 1)
-            if second_idx >= 0:
-                duplicate_in_asr.append(hw)
-                continue
-            start_word_idx = char_to_word[first_idx]
-            end_word_idx = char_to_word[first_idx + len(norm) - 1]
-            begin_time = words[start_word_idx].get("begin_time", 0)
-            end_time = words[end_word_idx].get("end_time", 0)
-            matched.append({
-                **hw,
-                "asrOffset": first_idx,
-                "asrEndOffset": first_idx + len(norm),
-                "beginTime": begin_time,
-                "endTime": end_time,
-                "matchScore": 1.0,
-                "matchType": "exact",
-            })
-            search_cursor = first_idx + len(norm)
-            continue
-
-        span = find_best_span(
-            norm,
-            stream,
-            start=search_cursor,
-            min_ratio=PARTIAL_MATCH_RATIO,
-            min_length=PARTIAL_MIN_LEN,
-        )
-        if span is not None:
-            start = span["start"]
-            end = span["end"]
-            start_word_idx = char_to_word[start]
-            end_word_idx = char_to_word[min(end - 1, len(char_to_word) - 1)]
-            begin_time = words[start_word_idx].get("begin_time", 0)
-            end_time = words[end_word_idx].get("end_time", 0)
-            partial_matched.append({
-                **hw,
-                "asrOffset": start,
-                "asrEndOffset": end,
-                "beginTime": begin_time,
-                "endTime": end_time,
-                "matchScore": span["score"],
-                "matchType": "fuzzy",
-            })
-            search_cursor = end
-            continue
-
-        unmatched.append(hw)
-
-    return matched, partial_matched, unmatched, duplicate_in_asr
-
-
-def _match_tail_hotwords(hotwords, words, lang, existing_matches):
-    candidates = find_tail_matches(
-        hotwords,
-        words,
-        lang,
-        norm_for_match,
-        existing_matches,
-        min_ratio=PARTIAL_MATCH_RATIO,
-        min_length=PARTIAL_MIN_LEN,
-    )
-    matched = []
-    for candidate in candidates:
-        start_word_idx = candidate["startWordIndex"]
-        end_word_idx = candidate["endWordIndex"]
-        matched.append({
-            **candidate,
-            "beginTime": words[start_word_idx].get("begin_time", 0),
-            "endTime": words[end_word_idx].get("end_time", 0),
-        })
-    return matched
-
-
-def _build_chunks(valid_hotwords, full_norm_len, total_duration_ms):
-    if not valid_hotwords:
+    if not anchors:
         return []
 
     pad_ms = int(FA_CHUNK_PAD_SEC * 1000)
@@ -606,7 +430,7 @@ def _build_chunks(valid_hotwords, full_norm_len, total_duration_ms):
     chunks = []
     idx = 0
 
-    first = valid_hotwords[0]
+    first = anchors[0]
     if first["offsetInFullNorm"] > 0:
         audio_start_ms, audio_end_ms = _window(0, first["endTime"])
         chunks.append({
@@ -618,9 +442,9 @@ def _build_chunks(valid_hotwords, full_norm_len, total_duration_ms):
         })
         idx += 1
 
-    for i in range(len(valid_hotwords) - 1):
-        cur = valid_hotwords[i]
-        nxt = valid_hotwords[i + 1]
+    for i in range(len(anchors) - 1):
+        cur = anchors[i]
+        nxt = anchors[i + 1]
         audio_start_ms, audio_end_ms = _window(cur["beginTime"], nxt["endTime"])
         chunks.append({
             "index": idx,
@@ -631,7 +455,7 @@ def _build_chunks(valid_hotwords, full_norm_len, total_duration_ms):
         })
         idx += 1
 
-    last = valid_hotwords[-1]
+    last = anchors[-1]
     if last["offsetInFullNorm"] + len(last["normText"]) < full_norm_len:
         audio_start_ms, audio_end_ms = _window(last["beginTime"], total_duration_ms)
         chunks.append({
@@ -807,9 +631,9 @@ def format_coverage_diagnosis(
 class CloudHotwordAlignPipeline:
     """Cloud ASR (hotword-anchored pathfinding) + local FA alignment pipeline.
 
-    Flow: extract hotwords from reference text -> upload audio to OSS ->
-    cloud ASR with vocabulary -> match hotwords in ASR word stream ->
-    monotonicity enforcement -> build chunks -> FA alignment per chunk.
+    Flow: select hotword terms from reference text -> upload audio to OSS ->
+    cloud ASR with vocabulary -> match term occurrences by LCS -> sample anchors ->
+    build chunks (or fixed-window fallback) -> FA alignment per chunk.
     """
 
     def __init__(self, fa_model, fa_lock, config):
@@ -825,17 +649,26 @@ class CloudHotwordAlignPipeline:
 
         log_info(f"━━━ Cloud Hotword 分支启动 | 语言={run_lang} ━━━", req_id=req_id)
 
-        hotwords = extract_hotwords(clean_reference_text, run_lang)
-        log_info(f"热词提取: {len(hotwords)} 个", req_id=req_id)
-
-        if len(hotwords) < 2:
-            raise ValueError(
-                f"热词不足 2 个（当前 {len(hotwords)}），无法进行锚点切块。"
-                f"语言={run_lang} | 参考文本={len(clean_reference_text)}字 | "
-                f"文本头: 「{_clip_text(clean_reference_text, DIAG_SNIPPET_LIMIT)}」"
-            )
-
-        vocabulary = {hw["text"]: HOTWORD_WEIGHT for hw in hotwords}
+        # 选词、锚点、切块、FA 参考文本必须共用这一份归一化文本与下标映射。
+        # 数字改写段（十→10）整段锚定到原文起点，混用两套映射会让后续位置整体漂移。
+        reference_norm, ref_idx_map = norm_for_match_with_map(clean_reference_text, run_lang)
+        terms = select_hotword_terms(
+            clean_reference_text,
+            run_lang,
+            normalize=norm_for_match,
+            norm_text=reference_norm,
+            norm_map=ref_idx_map,
+        )
+        vocabulary = {term.text: HOTWORD_WEIGHT for term in terms}
+        log_info(
+            f"热词提取: {len(terms)} 个"
+            + (
+                " | " + " | ".join(f"{term.text}({term.count})" for term in terms)
+                if terms
+                else "（空词表，不传 vocabulary）"
+            ),
+            req_id=req_id,
+        )
 
         file_url = _upload_oss(audio_path, req_id)
         task_id = _submit_cloud_asr(file_url, run_lang, vocabulary, req_id)
@@ -884,13 +717,11 @@ class CloudHotwordAlignPipeline:
             req_id=req_id,
         )
 
-        # 覆盖率诊断与 FA 参考文本共用这一份映射：它必须与切块偏移同源（同一份
-        # norm_for_match_with_map）。数字改写段（十→10、两百→200）整段锚定到原文起点，
-        # 故 norm 下标回映射原文不漂移；若另用「改写后文本下标 = 原文下标」的映射，
-        # 每次改写都会让后续位置整体右移（2026-10-18 第 44 章：漂移 12 字 →
-        # FA 参考文本越过音频窗口 3.1s，被判成伪对齐）。
-        reference_norm, ref_idx_map = norm_for_match_with_map(clean_reference_text, run_lang)
-        asr_norm, _ = build_asr_stream(words, run_lang, norm_for_match)
+        # 覆盖率诊断与 FA 参考文本共用上面那一份映射。数字改写段（十→10、两百→200）
+        # 整段锚定到原文起点，故 norm 下标回映射原文不漂移；若另用「改写后文本下标 =
+        # 原文下标」的映射，每次改写都会让后续位置整体右移（2026-10-18 第 44 章：
+        # 漂移 12 字 → FA 参考文本越过音频窗口 3.1s，被判成伪对齐）。
+        asr_norm, char_to_word = build_asr_stream(words, run_lang, norm_for_match)
         coverage = assess_reference_coverage(
             clean_reference_text,
             words,
@@ -919,85 +750,136 @@ class CloudHotwordAlignPipeline:
         )
 
         full_norm = reference_norm
-        matched, partial_matched, unmatched, duplicate_in_asr = _match_hotwords(
-            hotwords, words, run_lang
+        anchors, term_stats, dropped_anchors = match_hotword_anchors(
+            [term.text for term in terms],
+            reference_norm,
+            asr_norm,
+            char_to_word,
+            words,
         )
-        all_matched = matched + partial_matched
-        tail_matched = _match_tail_hotwords(unmatched, words, run_lang, all_matched)
-        if tail_matched:
-            partial_matched.extend(tail_matched)
-            all_matched.extend(tail_matched)
-            matched_norms = {item["normText"] for item in tail_matched}
-            unmatched = [
-                item for item in unmatched if item["normText"] not in matched_norms
+        log_block(
+            ["━━━ 热词匹配诊断 ━━━"]
+            + [
+                f"  {stat.text}: 参考 {stat.reference_count} | ASR {stat.asr_count} | "
+                f"命中 {stat.matched}"
+                for stat in term_stats
             ]
+            + [f"  锚点合计: {len(anchors)}"]
+            + (
+                [f"  时间回退丢弃: {len(dropped_anchors)} 个"]
+                if dropped_anchors
+                else []
+            ),
+            req_id=req_id,
+            level="INFO",
+        )
 
-        log_block([
-            "━━━ 热词匹配诊断 ━━━",
-            f"  精确匹配: {len(matched)} | 退化匹配(≥80%): {len(partial_matched)} | "
-            f"未匹配: {len(unmatched)} | ASR内重复: {len(duplicate_in_asr)}",
-        ] + ([
-            "  未匹配热词: " + " | ".join(
-                f"{h['text']}@norm[{h['offsetInFullNorm']}]" for h in unmatched
+        sampled = []
+        if len(anchors) < 2:
+            fallback_anchor = anchors[0] if anchors else None
+            reason = "没有热词锚点" if fallback_anchor is None else "只有 1 个热词锚点"
+            offset_lookup = build_reference_offset_lookup(
+                reference_norm, asr_norm, char_to_word, words
             )
-        ] if unmatched else []),
-            req_id=req_id, level="INFO")
-
-        valid, discarded = select_monotonic_chain(all_matched, "beginTime")
-        if discarded:
-            log_warn(f"单调性丢弃: {len(discarded)} 个热词", req_id=req_id)
-
-        # The ASR last-word timestamp can omit trailing audio. The decoded
-        # file duration is the authoritative end boundary for the tail chunk.
-        # If the last matched anchor is too late, the remaining reference text
-        # can be much longer than the tail audio. Qwen FA extrapolates timestamps
-        # for this case instead of clamping them to the supplied audio window.
-        effective_valid = list(valid)
-        removed_tail_anchors = []
-        first_tail_capacity_issue = None
-        text_rate = TEXT_RATE_BY_LANG[run_lang]
-        while len(effective_valid) > 1:
-            candidate_chunks = _build_chunks(
-                effective_valid, len(full_norm), physical_duration_ms
-            )
-            if not candidate_chunks:
-                break
-
-            tail = candidate_chunks[-1]
-            tail_audio_sec = (tail["audioEndMs"] - tail["audioStartMs"]) / 1000.0
-            tail_text_len = tail["textEnd"] - tail["textStart"]
-            if tail["textEnd"] != len(full_norm) or tail_audio_sec <= 0:
-                break
-
-            max_tail_text_len = tail_audio_sec * text_rate * TAIL_TEXT_CAPACITY_FACTOR
-            if tail_text_len <= max_tail_text_len:
-                break
-
-            if first_tail_capacity_issue is None:
-                first_tail_capacity_issue = (
-                    tail_text_len, tail_audio_sec, max_tail_text_len
-                )
-            removed_tail_anchors.append(effective_valid.pop())
-
-        if removed_tail_anchors:
-            tail_text_len, tail_audio_sec, max_tail_text_len = first_tail_capacity_issue
-            log_warn(
-                f"尾块文本容量不足 | norm字数={tail_text_len} | "
-                f"音频={tail_audio_sec:.3f}s | 估算容量={max_tail_text_len:.1f}字 | "
-                f"合并前移 {len(removed_tail_anchors)} 个尾锚点 | "
-                f"移除锚点: "
-                + " | ".join(
-                    f"{h['text']}@{h['beginTime'] / 1000:.3f}s"
-                    for h in removed_tail_anchors
+            chunks = build_fallback_chunks(
+                clean_reference_text,
+                int(physical_duration_ms),
+                text_offset_for_time=lambda ms: ref_idx_map[
+                    min(offset_lookup(ms), len(ref_idx_map) - 1)
+                ],
+                anchor_ms=fallback_anchor["beginTime"] if fallback_anchor else None,
+                anchor_text_offset=(
+                    ref_idx_map[fallback_anchor["offsetInFullNorm"]]
+                    if fallback_anchor
+                    else None
                 ),
+            )
+            log_warn(
+                f"{reason}，改用固定窗口回退 | 文本={len(clean_reference_text)}字 | "
+                f"音频={physical_audio_duration:.3f}s | 切块={len(chunks)} | "
+                f"文本边界按 ASR 词时间映射",
                 req_id=req_id,
             )
+        else:
+            sampled = sample_anchors(anchors)
+            anchor_gaps = [
+                current["beginTime"] - previous["endTime"]
+                for previous, current in zip(sampled, sampled[1:])
+            ]
+            max_gap = max(anchor_gaps) if anchor_gaps else 0
+            head_gap = max(0, sampled[0]["beginTime"])
+            tail_gap = max(0, int(physical_duration_ms) - sampled[-1]["endTime"])
+            log_info(
+                f"锚点抽样: {len(anchors)} -> {len(sampled)} | "
+                f"距开头={head_gap / 1000:.2f}s | 最大间隔={max_gap / 1000:.2f}s | "
+                f"距尾部={tail_gap / 1000:.2f}s",
+                req_id=req_id,
+            )
+            if (
+                head_gap > ANCHOR_GAP_WARN_MS
+                or max_gap > ANCHOR_GAP_WARN_MS
+                or tail_gap > ANCHOR_GAP_WARN_MS
+            ):
+                log_warn(
+                    f"锚点间隔过大 | 距开头={head_gap / 1000:.2f}s | "
+                    f"最大间隔={max_gap / 1000:.2f}s | "
+                    f"距尾部={tail_gap / 1000:.2f}s | "
+                    f"上限={ANCHOR_GAP_WARN_MS / 1000:.0f}s | "
+                    f"超过 {FA_MAX_SEC}s 的块会被截断",
+                    req_id=req_id,
+                )
 
-        chunks = _build_chunks(effective_valid, len(full_norm), physical_duration_ms)
+            # The ASR last-word timestamp can omit trailing audio. The decoded
+            # file duration is the authoritative end boundary for the tail chunk.
+            # If the last matched anchor is too late, the remaining reference text
+            # can be much longer than the tail audio. Qwen FA extrapolates timestamps
+            # for this case instead of clamping them to the supplied audio window.
+            effective_valid = list(sampled)
+            removed_tail_anchors = []
+            first_tail_capacity_issue = None
+            text_rate = TEXT_RATE_BY_LANG[run_lang]
+            while len(effective_valid) > 1:
+                candidate_chunks = _build_chunks(
+                    effective_valid, len(full_norm), physical_duration_ms
+                )
+                if not candidate_chunks:
+                    break
+
+                tail = candidate_chunks[-1]
+                tail_audio_sec = (tail["audioEndMs"] - tail["audioStartMs"]) / 1000.0
+                tail_text_len = tail["textEnd"] - tail["textStart"]
+                if tail["textEnd"] != len(full_norm) or tail_audio_sec <= 0:
+                    break
+
+                max_tail_text_len = tail_audio_sec * text_rate * TAIL_TEXT_CAPACITY_FACTOR
+                if tail_text_len <= max_tail_text_len:
+                    break
+
+                if first_tail_capacity_issue is None:
+                    first_tail_capacity_issue = (
+                        tail_text_len, tail_audio_sec, max_tail_text_len
+                    )
+                removed_tail_anchors.append(effective_valid.pop())
+
+            if removed_tail_anchors:
+                tail_text_len, tail_audio_sec, max_tail_text_len = first_tail_capacity_issue
+                log_warn(
+                    f"尾块文本容量不足 | norm字数={tail_text_len} | "
+                    f"音频={tail_audio_sec:.3f}s | 估算容量={max_tail_text_len:.1f}字 | "
+                    f"合并前移 {len(removed_tail_anchors)} 个尾锚点 | "
+                    f"移除锚点: "
+                    + " | ".join(
+                        f"{h['text']}@{h['beginTime'] / 1000:.3f}s"
+                        for h in removed_tail_anchors
+                    ),
+                    req_id=req_id,
+                )
+
+            chunks = _build_chunks(effective_valid, len(full_norm), physical_duration_ms)
+
         log_info(f"切块: {len(chunks)} 个", req_id=req_id)
-
         if not chunks:
-            raise ValueError("热词切块结果为空，无法进行 FA 对齐。")
+            raise ValueError("切块结果为空，无法进行 FA 对齐。")
 
         verbose_json = {
             "task": "transcribe",
@@ -1017,14 +899,19 @@ class CloudHotwordAlignPipeline:
         seam_clamp_count = 0
 
         for chunk in chunks:
-            text_start_norm = chunk["textStart"]
-            text_end_norm = chunk["textEnd"]
             audio_start_sec = chunk["audioStartMs"] / 1000.0
             audio_end_sec = chunk["audioEndMs"] / 1000.0
 
-            orig_start, orig_end = norm_span_to_original_span(
-                ref_idx_map, text_start_norm, text_end_norm, len(clean_reference_text)
-            )
+            if "origStart" in chunk:
+                orig_start = chunk["origStart"]
+                orig_end = chunk["origEnd"]
+            else:
+                orig_start, orig_end = norm_span_to_original_span(
+                    ref_idx_map,
+                    chunk["textStart"],
+                    chunk["textEnd"],
+                    len(clean_reference_text),
+                )
 
             ground_truth = clean_reference_text[orig_start:orig_end]
             if not ground_truth.strip():
@@ -1035,8 +922,7 @@ class CloudHotwordAlignPipeline:
                 log_info(
                     f"FA 尾部输入 | chunk[{chunk['index']}] | "
                     f"音频={audio_start_sec:.3f}..{audio_end_sec:.3f}s ({chunk_dur:.3f}s) | "
-                    f"原文norm={text_start_norm}:{text_end_norm} ({text_end_norm - text_start_norm}字) | "
-                    f"ground_truth={orig_start}:{orig_end} ({len(ground_truth)}字)",
+                    f"原文={orig_start}:{orig_end} ({len(ground_truth)}字)",
                     req_id=req_id,
                 )
             if chunk_dur > FA_MAX_SEC:
@@ -1153,7 +1039,7 @@ class CloudHotwordAlignPipeline:
             "📊 最终报告 (Cloud Hotword 对齐模式)",
             f"文件名       : {file_name}",
             f"执行状态     : ✅ 成功 (相似度: {verbose_json['report']['accuracy_ratio']})",
-            f"热词         : {len(hotwords)} 个 | 有效锚点: {len(effective_valid)} | 切块: {len(chunks)}",
+            f"热词         : {len(terms)} 个 | 锚点: {len(anchors)} | 抽样: {len(sampled)} | 切块: {len(chunks)}",
             f"音频时长     : {physical_audio_duration:.2f}s",
             f"流水线耗时   : {total_pipeline_time:.2f}s",
             f"RTF          : {total_pipeline_time / physical_audio_duration:.3f}" if physical_audio_duration > 0 else "RTF: N/A",

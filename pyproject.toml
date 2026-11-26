@@ -14,6 +14,7 @@ dependencies = [
     # —— 音频与文本处理 ——
     "soundfile==0.14.0",
     "zhconv==1.4.3",
+    "jieba==0.42.1",             # 即时热词选词：词性标注取名词，见 term_selection.py
     "Levenshtein==0.27.5",       # 底层为 C 的高性能比对引擎，供 hotword_matching 使用
     "epitran==1.35.3",           # IPA 转换；依赖系统 flite
     # —— 配置与运行时探针 ——
