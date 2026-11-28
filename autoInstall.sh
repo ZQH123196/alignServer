@@ -21,6 +21,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MyWorkDir="${MyWorkDir:-$SCRIPT_DIR}"
 export MODEL_ROOT_DIR="${MODEL_ROOT_DIR:-$HOME/autodl-fs/models}"
 
+# flite 存在性只在这里检查一次。提前告警，不提前退出：flite 可能由 apt 装依赖时带入。
+# 真的缺 flite 由脚本末尾安装并回验，安装不上在那里 exit。
+FLITE_PRESENT_AT_START=0
+if command -v flite >/dev/null 2>&1; then
+    FLITE_PRESENT_AT_START=1
+    echo "✅ 检测到 flite：$(command -v flite)"
+else
+    echo "⚠️ 未检测到 flite（epitran 的系统依赖）。脚本末尾会尝试用 apt 安装 flite；"
+    echo "   若当前无安装权限，脚本会在末尾失败。提前装：apt-get install -y flite"
+fi
+
 # DEVICE 决定 torch 变体。取值不合法立即退出，不回落默认值。
 DEVICE="${DEVICE:-cuda}"
 case "$DEVICE" in
@@ -325,15 +336,44 @@ swapoff -a || true
 
 # flite 是 epitran 的系统依赖（epitran 是 pyproject 的硬依赖），由 apt 提供。
 # 缺失时对齐模式不可用，故这里装不上就退出，不把问题留到运行时。
+#
+# 提权方式按当前身份决定，不写死 sudo：AutoDL 等 root 容器镜像不带 sudo，
+# 写死 sudo 时这些镜像必然 `sudo: command not found`。
+# 已存在的 flite 一律直接复用，不因装上的是旧版就重装：硬下限只要求命令存在。
+#
+# 注意英语按设计不可用：Ubuntu 的 flite 包只提供 t2p，不含 lex_lookup，
+# 而 epitran 的 eng-Latn 映射表依赖 lex_lookup。装了 flite 也跑不了英语。
+# 这是功能边界，不是安装问题，本脚本不修。详见 README「已知限制：epitran 的 IPA 映射表」。
 if command -v flite >/dev/null 2>&1; then
     echo "✅ flite 已存在：$(command -v flite)"
 else
+    if [ "$FLITE_PRESENT_AT_START" -eq 1 ]; then
+        echo "⚠️ flite 在启动时存在，现在找不到了。PATH 或文件可能被改动。"
+    fi
     echo "[*] 正在安装 flite（epitran 的系统依赖）..."
-    sudo apt-get install -y flite
-    command -v flite >/dev/null 2>&1 || {
+    # 精简镜像可能连 apt-get 都没有。先查它，让失败信息停在这里，
+    # 而不是退回到要从 `apt-get: command not found` 反推。
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo "[FATAL] flite 缺失，且系统无 apt-get（非 Debian/Ubuntu 系，或精简镜像）。" >&2
+        echo "        请用本发行版的包管理器手工安装 flite 后重跑本脚本。" >&2
+        exit 1
+    fi
+    if [ "$(id -u)" -eq 0 ]; then
+        echo "    当前身份是 root，直接调用 apt-get"
+        apt-get install -y flite
+    elif command -v sudo >/dev/null 2>&1; then
+        echo "    当前身份非 root，经 sudo 调用 apt-get"
+        sudo apt-get install -y flite
+    else
+        echo "[FATAL] flite 缺失，且当前身份非 root、系统无 sudo，无法自动安装。" >&2
+        echo "        请用 root 执行：apt-get install -y flite" >&2
+        echo "        或先安装 sudo，再重跑本脚本。" >&2
+        exit 1
+    fi
+    if ! command -v flite >/dev/null 2>&1; then
         echo "[FATAL] flite 安装后 PATH 中仍找不到。epitran 无法工作。" >&2
         exit 1
-    }
+    fi
     echo "✅ flite 安装完成：$(command -v flite)"
 fi
 

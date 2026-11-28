@@ -254,6 +254,8 @@ uv pip install flash-attn --no-build-isolation
 
 结论：这 12 种语言里，本地对齐实际可用 10 种。英语与日语需另行处理（走云端热词分支，或换 IPA 方案）。
 
+英语这一条是**功能边界，不是安装问题**：`autoInstall.sh` 装上系统 flite 已经算成功，不要再往「装别的 flite 包」方向排查。`autoInstall.sh` 的 flite 安装块顶部有同一条注释，改安装逻辑前先读它。
+
 ## 多语言约束
 
 块级修复（`cloud_hotword.py` 的 `_decide_chunk_repairs` / `_repair_chunk_words`）与语言无关，靠下面五条约束成立。**改这两个函数之前必须先读完本节。**
